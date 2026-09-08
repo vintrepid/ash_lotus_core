@@ -22,12 +22,12 @@ defmodule Ash.Test.GeneratorTest do
     use Ash.Resource, data_layer: :embedded
 
     actions do
-      defaults [:read, :destroy, create: :*, update: :*]
+      defaults([:read, :destroy, create: :*, update: :*])
     end
 
     attributes do
-      uuid_primary_key :id
-      attribute :name, :string
+      uuid_primary_key(:id)
+      attribute(:name, :string)
     end
   end
 
@@ -42,46 +42,48 @@ defmodule Ash.Test.GeneratorTest do
     end
 
     actions do
-      default_accept :*
-      defaults [:read, :destroy, create: :*, update: :*]
+      default_accept(:*)
+      defaults([:read, :destroy, create: :*, update: :*])
 
       update :new_post do
-        require_atomic? false
-        argument :posts, {:array, :map}, allow_nil?: false
-        change manage_relationship(:posts, type: :create)
+        require_atomic?(false)
+        argument(:posts, {:array, :map}, allow_nil?: false)
+        change(manage_relationship(:posts, type: :create))
       end
 
       update :new_post_private do
-        require_atomic? false
-        argument :posts, {:array, :map}, allow_nil?: false, public?: false
-        change manage_relationship(:posts, type: :create)
+        require_atomic?(false)
+        argument(:posts, {:array, :map}, allow_nil?: false, public?: false)
+        change(manage_relationship(:posts, type: :create))
       end
     end
 
     attributes do
-      uuid_primary_key :id
-      attribute :name, :string, default: "Fred", public?: true
+      uuid_primary_key(:id)
+      attribute(:name, :string, default: "Fred", public?: true)
 
       attribute :metadata, :map do
         public?(true)
-        allow_nil? true
+        allow_nil?(true)
       end
 
       attribute :meta, :map do
         public?(true)
-        allow_nil? false
+        allow_nil?(false)
       end
     end
 
     relationships do
-      has_many :posts, Ash.Test.GeneratorTest.Post,
+      has_many(:posts, Ash.Test.GeneratorTest.Post,
         destination_attribute: :author_id,
         public?: true
+      )
 
-      has_one :latest_post, Ash.Test.GeneratorTest.Post,
+      has_one(:latest_post, Ash.Test.GeneratorTest.Post,
         destination_attribute: :author_id,
         sort: [inserted_at: :desc],
         public?: true
+      )
     end
   end
 
@@ -96,28 +98,29 @@ defmodule Ash.Test.GeneratorTest do
     end
 
     actions do
-      default_accept :*
-      defaults [:read, :destroy, create: :*, update: :*]
+      default_accept(:*)
+      defaults([:read, :destroy, create: :*, update: :*])
 
       update :new_post do
-        require_atomic? false
-        argument :posts, {:array, :map}, allow_nil?: false
+        require_atomic?(false)
+        argument(:posts, {:array, :map}, allow_nil?: false)
       end
     end
 
     changes do
-      change manage_relationship(:posts, type: :create), on: [:update]
+      change(manage_relationship(:posts, type: :create), on: [:update])
     end
 
     attributes do
-      uuid_primary_key :id
-      attribute :name, :string, default: "Fred", public?: true
+      uuid_primary_key(:id)
+      attribute(:name, :string, default: "Fred", public?: true)
     end
 
     relationships do
-      has_many :posts, Ash.Test.GeneratorTest.Post,
+      has_many(:posts, Ash.Test.GeneratorTest.Post,
         destination_attribute: :author_id,
         public?: true
+      )
     end
   end
 
@@ -130,22 +133,22 @@ defmodule Ash.Test.GeneratorTest do
     end
 
     actions do
-      default_accept :*
-      defaults [:read, :destroy, create: :*, update: :*]
+      default_accept(:*)
+      defaults([:read, :destroy, create: :*, update: :*])
 
       read :read_with_args do
-        argument :title_filter, :string
-        argument :category_filter, :string
+        argument(:title_filter, :string)
+        argument(:category_filter, :string)
       end
 
       destroy :destroy_with_reason do
-        argument :reason, :string
-        argument :confirmed, :boolean, default: false
+        argument(:reason, :string)
+        argument(:confirmed, :boolean, default: false)
       end
     end
 
     attributes do
-      uuid_primary_key :id
+      uuid_primary_key(:id)
 
       attribute :title, :string do
         public?(true)
@@ -164,23 +167,24 @@ defmodule Ash.Test.GeneratorTest do
       end
 
       attribute :embedded, Embedded do
-        public? true
-        allow_nil? false
+        public?(true)
+        allow_nil?(false)
       end
 
       timestamps()
     end
 
     relationships do
-      belongs_to :author, Author, public?: true
+      belongs_to(:author, Author, public?: true)
 
-      has_many :ratings, Ash.Test.GeneratorTest.Rating, public?: true
+      has_many(:ratings, Ash.Test.GeneratorTest.Rating, public?: true)
 
-      many_to_many :categories, Ash.Test.GeneratorTest.Category,
+      many_to_many(:categories, Ash.Test.GeneratorTest.Category,
         through: Ash.Test.GeneratorTest.PostCategory,
         destination_attribute_on_join_resource: :category_id,
         source_attribute_on_join_resource: :post_id,
         public?: true
+      )
     end
   end
 
@@ -193,17 +197,18 @@ defmodule Ash.Test.GeneratorTest do
     end
 
     actions do
-      default_accept :*
-      defaults [:read, :destroy, create: :*, update: :*]
+      default_accept(:*)
+      defaults([:read, :destroy, create: :*, update: :*])
     end
 
     relationships do
-      belongs_to :post, Post, primary_key?: true, allow_nil?: false, public?: true
+      belongs_to(:post, Post, primary_key?: true, allow_nil?: false, public?: true)
 
-      belongs_to :category, Ash.Test.GeneratorTest.Category,
+      belongs_to(:category, Ash.Test.GeneratorTest.Category,
         primary_key?: true,
         allow_nil?: false,
         public?: true
+      )
     end
   end
 
@@ -216,16 +221,16 @@ defmodule Ash.Test.GeneratorTest do
     end
 
     identities do
-      identity :unique_name, [:name], pre_check_with: Domain
+      identity(:unique_name, [:name], pre_check_with: Domain)
     end
 
     actions do
-      default_accept :*
-      defaults [:read, :destroy, create: :*, update: :*]
+      default_accept(:*)
+      defaults([:read, :destroy, create: :*, update: :*])
     end
 
     attributes do
-      uuid_primary_key :id
+      uuid_primary_key(:id)
 
       attribute :name, :string do
         public?(true)
@@ -233,11 +238,12 @@ defmodule Ash.Test.GeneratorTest do
     end
 
     relationships do
-      many_to_many :posts, Post,
+      many_to_many(:posts, Post,
         public?: true,
         through: PostCategory,
         destination_attribute_on_join_resource: :post_id,
         source_attribute_on_join_resource: :category_id
+      )
     end
   end
 
@@ -247,11 +253,11 @@ defmodule Ash.Test.GeneratorTest do
       data_layer: Ash.DataLayer.Ets
 
     ets do
-      private? true
+      private?(true)
     end
 
     attributes do
-      uuid_primary_key :id
+      uuid_primary_key(:id)
 
       attribute :rating, :integer do
         public?(true)
@@ -259,8 +265,8 @@ defmodule Ash.Test.GeneratorTest do
     end
 
     actions do
-      default_accept :*
-      defaults [:read, :destroy, create: :*, update: :*]
+      default_accept(:*)
+      defaults([:read, :destroy, create: :*, update: :*])
     end
 
     relationships do
@@ -280,13 +286,13 @@ defmodule Ash.Test.GeneratorTest do
     end
 
     actions do
-      default_accept :*
-      defaults [:read]
+      default_accept(:*)
+      defaults([:read])
 
       create :create do
-        accept [:name]
+        accept([:name])
 
-        change fn changeset, _ctx ->
+        change(fn changeset, _ctx ->
           # Record whatever `marker` this changeset *started* with, then set a
           # marker tailored to this specific changeset. If `generate_many/2`
           # forwarded the whole changeset context (post-change) instead of only
@@ -316,16 +322,16 @@ defmodule Ash.Test.GeneratorTest do
           changeset
           |> Ash.Changeset.force_change_attribute(:seen_marker, seen_marker)
           |> Ash.Changeset.set_context(%{shared: %{marker: name}})
-        end
+        end)
       end
     end
 
     attributes do
-      uuid_primary_key :id
+      uuid_primary_key(:id)
 
       attribute :name, :string do
         public?(true)
-        allow_nil? false
+        allow_nil?(false)
       end
 
       attribute :scope_id, :integer do
@@ -351,33 +357,33 @@ defmodule Ash.Test.GeneratorTest do
     end
 
     actions do
-      default_accept :*
+      default_accept(:*)
 
       create :create do
-        primary? true
-        allow_nil_input [:required_attr]
-        require_attributes [:defaulted_attr]
+        primary?(true)
+        allow_nil_input([:required_attr])
+        require_attributes([:defaulted_attr])
       end
 
-      defaults [:read, :destroy, update: :*]
+      defaults([:read, :destroy, update: :*])
     end
 
     attributes do
-      uuid_primary_key :id
+      uuid_primary_key(:id)
 
       attribute :required_attr, :string do
         public?(true)
-        allow_nil? false
+        allow_nil?(false)
       end
 
       attribute :defaulted_attr, :string do
         public?(true)
-        default "default value"
+        default("default value")
       end
 
       attribute :regular_required, :string do
         public?(true)
-        allow_nil? false
+        allow_nil?(false)
       end
     end
   end
@@ -779,7 +785,11 @@ defmodule Ash.Test.GeneratorTest do
   end
 
   test "string generator honors trim?: true" do
-    check all(string <- Ash.Type.String.generator(min_length: 5, trim?: true)) do
+    check(
+      all(
+        string <- Ash.Type.String.generator(length_count: :graphemes, min_length: 5, trim?: true)
+      )
+    ) do
       assert String.length(String.trim(string)) >= 5
     end
   end
