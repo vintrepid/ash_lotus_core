@@ -149,7 +149,7 @@ if Code.ensure_loaded?(Igniter) do
             base =
               Igniter.Project.Module.parse(options[:base])
 
-            if base not in List.wrap(Application.get_env(app_name, :base_resources)) do
+            if base not in configured_base_resources(igniter, app_name) do
               raise """
               The base module #{inspect(base)} is not in the list of base resources.
 
@@ -776,6 +776,56 @@ if Code.ensure_loaded?(Igniter) do
                1
              ) do
         Igniter.Code.Common.move_to_do_block(zipper)
+      end
+    end
+
+    defp configured_base_resources(igniter, app_name) do
+      config_path = Igniter.Project.Application.config_path(igniter)
+      igniter = Igniter.include_existing_file(igniter, config_path, required?: false)
+
+      with {:ok, source} <- Rewrite.source(igniter.rewrite, config_path),
+           zipper <- source |> Rewrite.Source.get(:quoted) |> Sourceror.Zipper.zip(),
+           {:ok, resources} <- configured_base_resources_from(zipper, app_name, :error) do
+        List.wrap(resources)
+      else
+        _ -> List.wrap(Application.get_env(app_name, :base_resources))
+      end
+    end
+
+    defp configured_base_resources_from(nil, _app_name, result), do: result
+
+    defp configured_base_resources_from(zipper, app_name, result) do
+      case Igniter.Code.Function.move_to_function_call_in_current_scope(
+             zipper,
+             :config,
+             :any,
+             fn call ->
+               Igniter.Code.Function.argument_equals?(call, 0, app_name) and
+                 (Igniter.Code.Function.argument_equals?(call, 1, :base_resources) or
+                    Igniter.Code.Function.argument_matches_predicate?(call, 1, fn argument ->
+                      match?({:ok, _}, Igniter.Code.Keyword.get_key(argument, :base_resources))
+                    end))
+             end
+           ) do
+        {:ok, call} ->
+          result =
+            with {:ok, value} <- configured_base_resources_value(call),
+                 do: Igniter.Code.Common.expand_literal(value)
+
+          configured_base_resources_from(Sourceror.Zipper.right(call), app_name, result)
+
+        :error ->
+          result
+      end
+    end
+
+    defp configured_base_resources_value(call) do
+      if Igniter.Code.Function.argument_equals?(call, 1, :base_resources) do
+        Igniter.Code.Function.move_to_nth_argument(call, 2)
+      else
+        with {:ok, keyword} <- Igniter.Code.Function.move_to_nth_argument(call, 1) do
+          Igniter.Code.Keyword.get_key(keyword, :base_resources)
+        end
       end
     end
   end
