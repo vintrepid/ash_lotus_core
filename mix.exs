@@ -10,7 +10,7 @@ defmodule Ash.MixProject do
   A declarative, extensible framework for building Elixir applications.
   """
 
-  @version "3.33.1"
+  @version "3.34.6"
 
   def project do
     [
@@ -105,6 +105,7 @@ defmodule Ash.MixProject do
         "documentation/topics/advanced/combination-queries.md",
         "documentation/topics/advanced/timeouts.md",
         "documentation/topics/advanced/multitenancy.md",
+        "documentation/topics/advanced/temporal-resources.md",
         "documentation/topics/advanced/writing-extensions.md",
         "documentation/topics/advanced/code-generation.md",
         "documentation/moved/upgrade.md",
@@ -204,6 +205,8 @@ defmodule Ash.MixProject do
         Resources: [
           Ash.Resource.Calculation,
           Ash.Resource.Calculation.Builtins,
+          Ash.Resource.Actions.Implementation,
+          Ash.Resource.Actions.Implementation.Builtins,
           Ash.CodeInterface,
           Ash.Notifier,
           Ash.Notifier.Notification,
@@ -365,7 +368,7 @@ defmodule Ash.MixProject do
         "Changelog" => "https://github.com/ash-project/ash/blob/main/CHANGELOG.md",
         "Discord" => "https://discord.gg/HTHRaaVPUc",
         "Website" => "https://ash-hq.org",
-        "Forum" => "https://elixirforum.com/c/elixir-framework-forums/ash-framework-forum",
+        "Forum" => "https://elixirforum.com/ash",
         "REUSE Compliance" => "https://api.reuse.software/info/github.com/ash-project/ash"
       }
     ]
@@ -380,15 +383,14 @@ defmodule Ash.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:usage_rules, "~> 1.2 and >= 1.2.8", only: [:dev]},
       # DSLs
-      {:spark, ">= 2.6.0"},
+      {:spark, "~> 2.7 and >= 2.7.6"},
       # Ash resources are backed by ecto scheams
       {:ecto, "~> 3.14 and >= 3.14.2"},
       # Used by the ETS data layer
       {:ets, "~> 0.9.0"},
       # Data & types
-      {:decimal, "~> 2.0 or ~> 3.0"},
+      {:decimal, "~> 3.1 and >= 3.1.2"},
       {:jason, ">= 1.0.0"},
       # Observability
       {:telemetry, "~> 1.4 and >= 1.4.2"},
@@ -413,7 +415,7 @@ defmodule Ash.MixProject do
       {:eflame, "~> 1.0 and >= 1.0.1", only: [:dev, :test]},
       {:ex_doc, "~> 0.40.4", only: [:dev, :test], runtime: false},
       {:makeup_diff, "~> 0.1.1", only: [:dev, :test], runtime: false},
-      {:ex_check, "~> 0.16.0", only: [:dev, :test]},
+      {:ex_check, "~> 0.17.0", only: [:dev, :test]},
       {:credo, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:dialyxir, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:mimic, "~> 2.4", only: [:test]},

@@ -1,0 +1,29 @@
+{
+  "active_task": {
+    "repository": "/Users/vince/dev/forks/ash_lotus_core",
+    "checkout": "/Users/vince/dev/forks/ash_lotus_core",
+    "branch": "maintenance/ash-lotus-core/security-refresh-3-34-6",
+    "base_branch": "main",
+    "base_commit": "fc4185358a25b3e84b10eceb4f98666532701116",
+    "owner": "Codex task_classifier_audit",
+    "status": "ready_for_review",
+    "checkout_exception": null,
+    "objective": "Refresh the first-party Ash core fork to the upstream security-fixed v3.34.6 release while preserving downstream maintenance patches and checking its security regressions.",
+    "handoff": "Publish the verified focused branch for review and return an immutable revision; no consumer edits, merge or deployment authorized.",
+    "deployment_status": "Not deployed; main and consumers remain unchanged",
+    "upstream_release": "v3.34.6",
+    "upstream_commit": "111f6c9c331bc4221babcf5617e3309a13f1bb08",
+    "branch_diff_url": "https://github.com/vintrepid/ash_lotus_core/compare/main...maintenance/ash-lotus-core/security-refresh-3-34-6",
+    "verification": [
+      "mix check --no-retry --format agent: 12 configured checks passed; zero failures",
+      "Full upstream ExUnit suite: 4506 passed (6 doctests, 7 properties, 4493 tests)",
+      "Explicit advisory and generator regression files: 311 tests passed",
+      "Both dependency audits passed with Decimal 3.1.2 and Spark 2.7.6",
+      "Runtime lib sources exactly match the verified upstream v3.34.6 tag; all four Ash advisory fix commits retained",
+      "REUSE, formatting, generated DSL checks and whitespace checks passed; upstream remote remains push-disabled",
+      "One persistent checkout; no worktree exception"
+    ],
+    "integration_gate": "Distribution immutable pin must not advance until the separate AshLotus scratch compatibility matrix passes.",
+    "scope_notes": "Existing fork dependency floors retained. Superseded generator/filter patches now use upstream equivalents. Obsolete dev-only usage_rules dependency removed, matching upstream; no checks disabled."
+  }
+}

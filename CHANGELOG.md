@@ -8,6 +8,264 @@ SPDX-License-Identifier: MIT
 
 <!-- changelog -->
 
+## [v3.34.6](https://github.com/ash-project/ash/compare/v3.34.5...v3.34.6) (2026-10-09)
+
+
+
+
+### Bug Fixes:
+
+* [security] apply related resources' read policies to filters and sorts in `Ash.count/2`, `Ash.exists/2` and `Ash.aggregate/3` ([CVE-2026-101028](https://cna.erlef.org/cves/CVE-2026-101028.html), [GHSA-xj24-8f5c-pp5p](https://github.com/ash-project/ash/security/advisories/GHSA-xj24-8f5c-pp5p)) by [@zachdaniel](https://github.com/zachdaniel)
+
+* correct type casting in operators by [@zachdaniel](https://github.com/zachdaniel)
+
+* match embedded resource structs in equal? without expanding them (#3006) by Moxley Stratton [(#3006)](https://github.com/ash-project/ash/pull/3006)
+
+## [v3.34.5](https://github.com/ash-project/ash/compare/v3.34.4...v3.34.5) (2026-10-08)
+
+
+
+
+### Improvements:
+
+* normalize all notification return shapes by [@zachdaniel](https://github.com/zachdaniel) [(#2991)](https://github.com/ash-project/ash/pull/2991)
+
+### Bug Fixes:
+
+* field policy related filter fix (#3002) by Moxley Stratton [(#3002)](https://github.com/ash-project/ash/pull/3002)
+
+* refuse a read as_of that names no instant, rather than raising FunctionClauseError (#2999) by [@matt-beanland](https://github.com/matt-beanland) [(#2999)](https://github.com/ash-project/ash/pull/2999)
+
+* hold a temporal write's as_of to its period's type and constraints (#2997) by [@matt-beanland](https://github.com/matt-beanland) [(#2997)](https://github.com/ash-project/ash/pull/2997)
+
+* make every temporal write as of one instant Ash resolves (#2995) by [@matt-beanland](https://github.com/matt-beanland) [(#2995)](https://github.com/ash-project/ash/pull/2995)
+
+* compare embedded resources attribute by attribute by [@zachdaniel](https://github.com/zachdaniel) [(#2993)](https://github.com/ash-project/ash/pull/2993)
+
+* compare embedded resources attribute by attribute by [@padde](https://github.com/padde) [(#2993)](https://github.com/ash-project/ash/pull/2993)
+
+## [v3.34.4](https://github.com/ash-project/ash/compare/v3.34.3...v3.34.4) (2026-10-04)
+
+
+
+
+### Improvements:
+
+* allow opting out of `run` compile time dependencies by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v3.34.3](https://github.com/ash-project/ash/compare/v3.34.2...v3.34.3) (2026-10-04)
+
+
+
+
+### Bug Fixes:
+
+* don't create atoms when filtering on an atom by [@zachdaniel](https://github.com/zachdaniel)
+
+Fixes CVE-2026-94201
+
+* track calculation nullability through dynamic calculations by [@zachdaniel](https://github.com/zachdaniel)
+
+* handle defaults in aggregate nullability for manifests by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v3.34.2](https://github.com/ash-project/ash/compare/v3.34.1...v3.34.2) (2026-10-04)
+
+
+
+
+### Performance Improvements:
+
+* less compile time dependencies for policies by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v3.34.1](https://github.com/ash-project/ash/compare/v3.34.0...v3.34.1) (2026-10-04)
+
+
+
+
+### Bug Fixes:
+
+* manifest: wait for type modules still compiling instead of treating them as missing by [@Torkan](https://github.com/Torkan) [(#2986)](https://github.com/ash-project/ash/pull/2986)
+
+### Performance Improvements:
+
+* speed up compiles and lower module size by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v3.34.0](https://github.com/ash-project/ash/compare/v3.33.11...v3.34.0) (2026-10-03)
+
+
+
+
+### Features:
+
+* add temporal resources by [@zachdaniel](https://github.com/zachdaniel)
+
+### Improvements:
+
+* record the define line on code interface functions (#2971) by Onni Hakala [(#2971)](https://github.com/ash-project/ash/pull/2971)
+
+### Bug Fixes:
+
+* add action name to JSON-serialized manifest dumps (#2982) by [@Torkan](https://github.com/Torkan) [(#2982)](https://github.com/ash-project/ash/pull/2982)
+
+* properly dump atomic values in ETS data layer by [@zachdaniel](https://github.com/zachdaniel)
+
+* give modify_query the read action's arguments when running aggregates (#2980) by Alt-iOS [(#2980)](https://github.com/ash-project/ash/pull/2980)
+
+* handle forbidden placeholder errors properly everywhere by [@zachdaniel](https://github.com/zachdaniel)
+
+* various fixes for notification accumulation by [@zachdaniel](https://github.com/zachdaniel)
+
+* properly combine filters during atomic upgrade by [@zachdaniel](https://github.com/zachdaniel)
+
+* keep the original literal default when a compile-time cast is not escapable (#2966) by alter [(#2966)](https://github.com/ash-project/ash/pull/2966)
+
+## [v3.33.11](https://github.com/ash-project/ash/compare/v3.33.10...v3.33.11) (2026-09-25)
+
+
+
+
+### Bug Fixes:
+
+* enforce public? on argument matching in bulk destroy/update (CVE-2026-93477) by [@zachdaniel](https://github.com/zachdaniel)
+
+* properly compare unions w/ `Ash.Type.equal?` by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v3.33.10](https://github.com/ash-project/ash/compare/v3.33.9...v3.33.10) (2026-09-24)
+
+
+
+
+### Bug Fixes:
+
+* clamp page limit to max page size by [@zachdaniel](https://github.com/zachdaniel)
+
+* return an invalid error for bad page options passed to read functions (#2963) by grempe [(#2963)](https://github.com/ash-project/ash/pull/2963)
+
+* preserve field paths and messages in embedded array errors (#2946) by Alt-iOS [(#2946)](https://github.com/ash-project/ash/pull/2946)
+
+* pass through `{:not_atomic, _}` from where conditions and verify them at compile time by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v3.33.9](https://github.com/ash-project/ash/compare/v3.33.8...v3.33.9) (2026-09-21)
+
+
+
+
+### Bug Fixes:
+
+* reinstate lazy calculations fix by [@zachdaniel](https://github.com/zachdaniel)
+
+* ensure actor and tenant context is available to changes on soft destroys (#2958) by aVikingTrex [(#2958)](https://github.com/ash-project/ash/pull/2958)
+
+## [v3.33.8](https://github.com/ash-project/ash/compare/v3.33.7...v3.33.8) (2026-09-21)
+
+
+### Bug Fixes:
+
+* revert: properly prevent reloading lazy calculations by [@zachdaniel](https://github.com/zachdaniel)
+
+This caused calculations with arguments to not be reloaded
+
+
+## [v3.33.7](https://github.com/ash-project/ash/compare/v3.33.6...v3.33.7) (2026-09-21)
+
+
+
+
+### Bug Fixes:
+
+* properly prevent reloading lazy calculations by [@zachdaniel](https://github.com/zachdaniel)
+
+* handle parsing errors for relationship filters by [@zachdaniel](https://github.com/zachdaniel)
+
+### Performance Improvements:
+
+* store static policy expressions at compile time by [@zachdaniel](https://github.com/zachdaniel)
+
+* constant fold policy expressions before other expensive logic by [@zachdaniel](https://github.com/zachdaniel)
+
+* don't run authorization code if there are no authorizers by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v3.33.6](https://github.com/ash-project/ash/compare/v3.33.5...v3.33.6) (2026-09-18)
+
+
+
+
+### Improvements:
+
+* allow overriding `init/1` by [@zachdaniel](https://github.com/zachdaniel)
+
+* check expression arguments against declared function argument types (#2948) by [@zachdaniel](https://github.com/zachdaniel)
+
+### Bug Fixes:
+
+* validate malformed boolean filter groups (#2951) by Wu Shuwen [(#2951)](https://github.com/ash-project/ash/pull/2951)
+
+* resolve aggregate types in manifest reachability (#2950) by [@pshoukry](https://github.com/pshoukry) [(#2950)](https://github.com/ash-project/ash/pull/2950)
+
+## [v3.33.5](https://github.com/ash-project/ash/compare/v3.33.4...v3.33.5) (2026-09-17)
+
+
+
+
+### Improvements:
+
+* use O(1) event listener lookup by [@zachdaniel](https://github.com/zachdaniel)
+
+### Bug Fixes:
+
+* return an invalid error for sort input that is not a string or list (#2947) by [@chiliec](https://github.com/chiliec) [(#2947)](https://github.com/ash-project/ash/pull/2947)
+
+* don't pass `return_query?` and `stream?` in code interface opts by [@zachdaniel](https://github.com/zachdaniel)
+
+* handle notifications w/o an action set by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v3.33.4](https://github.com/ash-project/ash/compare/v3.33.3...v3.33.4) (2026-09-15)
+
+
+
+
+### Bug Fixes:
+
+* apply field policies to calculations and aggregates referenced in filters (CVE-2026-86338) by [@zachdaniel](https://github.com/zachdaniel)
+
+* use nested lists for notification optimization by [@zachdaniel](https://github.com/zachdaniel)
+
+* don't write empty lists to pdict for no reason by [@zachdaniel](https://github.com/zachdaniel)
+
+* don't pass the extra pagination row to read hooks (#2916) by [@barnabasJ](https://github.com/barnabasJ) [(#2916)](https://github.com/ash-project/ash/pull/2916)
+
+* reject the unsupported `return_query?` option in `Ash.stream!/2` (#2934) by [@jimsynz](https://github.com/jimsynz) [(#2934)](https://github.com/ash-project/ash/pull/2934)
+
+* don't ask whether a resource can join itself (#2931) by jeroen11dijk [(#2931)](https://github.com/ash-project/ash/pull/2931)
+
+* unwrap map-form notifications from a non-bulk manual action result (#2930) by [@Torkan](https://github.com/Torkan) [(#2930)](https://github.com/ash-project/ash/pull/2930)
+
+* don't drop notifications returned as a list from manual destroy actions (#2929) by [@Torkan](https://github.com/Torkan) [(#2929)](https://github.com/ash-project/ash/pull/2929)
+
+* setting undeclared argument was done with `nil` key (#2925) by Rutgerdj [(#2925)](https://github.com/ash-project/ash/pull/2925)
+
+## [v3.33.3](https://github.com/ash-project/ash/compare/v3.33.2...v3.33.3) (2026-09-10)
+
+
+
+
+### Bug Fixes:
+
+* don't check codepoints config when in a dependency by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v3.33.2](https://github.com/ash-project/ash/compare/v3.33.1...v3.33.2) (2026-09-10)
+
+
+
+
+### Improvements:
+
+* passing tenant in the transaction reason (#2917) by [@C-Sinclair](https://github.com/C-Sinclair) [(#2917)](https://github.com/ash-project/ash/pull/2917)
+
+### Bug Fixes:
+
+* don't require codepoints config unless a string attribute is present by [@zachdaniel](https://github.com/zachdaniel)
+
 ## [v3.33.1](https://github.com/ash-project/ash/compare/v3.33.0...v3.33.1) (2026-09-08)
 
 

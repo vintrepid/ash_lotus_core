@@ -82,8 +82,15 @@ defmodule Ash.Actions.Aggregate do
             Ash.Tracer.set_metadata(opts[:tracer], :action, metadata)
 
             with {:ok, query} <- Ash.Actions.Read.handle_multitenancy(query),
+                 pre_authorization_query <- query,
                  {:ok, %{valid?: true} = query} <-
                    authorize_query(query, opts, agg_authorize?),
+                 {:ok, %{valid?: true} = query} <-
+                   Ash.Actions.Read.prepare_for_aggregate(
+                     query,
+                     pre_authorization_query,
+                     Keyword.put(opts, :authorize?, agg_authorize?)
+                   ),
                  {:ok, aggregates} <- validate_aggregates(query, aggregates, opts),
                  {:ok, aggregates} <-
                    authorize_aggregate_fields(
@@ -101,7 +108,7 @@ defmodule Ash.Actions.Aggregate do
                 Enum.reduce_while(
                   [
                     {bypass_aggs,
-                     Map.merge(query.context || %{}, %{
+                     Ash.Helpers.deep_merge_maps(query.context || %{}, %{
                        shared: %{private: %{multitenancy: :bypass_all}}
                      })},
                     {tenant_aggs, query.context}
@@ -115,6 +122,7 @@ defmodule Ash.Actions.Aggregate do
                       with {:ok, data_layer_query} <-
                              Ash.Query.data_layer_query(%Ash.Query{
                                action: Ash.Resource.Info.action(query.resource, read_action),
+                               arguments: query.arguments,
                                resource: query.resource,
                                limit: query.limit,
                                offset: query.offset,
@@ -125,6 +133,7 @@ defmodule Ash.Actions.Aggregate do
                                tenant: query.tenant,
                                filter: query.filter,
                                to_tenant: query.to_tenant,
+                               as_of: query.as_of,
                                context: context
                              }),
                            {:ok, group_results} <-
@@ -230,7 +239,7 @@ defmodule Ash.Actions.Aggregate do
   defp referenced_field_name(_), do: nil
 
   defp authorize_query(query, opts, agg_authorize?) do
-    if agg_authorize? do
+    if agg_authorize? && Ash.Actions.Helpers.authorizers?(query) do
       case Ash.can(query, opts[:actor],
              return_forbidden_error?: true,
              pre_flight?: false,

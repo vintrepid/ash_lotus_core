@@ -4,6 +4,11 @@
 
 version = 1
 
+[[annotations]]
+path = "current_task.json"
+SPDX-FileCopyrightText = "2026 Vince Nibler"
+SPDX-License-Identifier = "MIT"
+
 # AALang-Gab assets are JSON-LD and other formats that cannot carry SPDX tags inline;
 # annotate the tree for REUSE compliance (see https://reuse.software/spec/).
 [[annotations]]

@@ -73,6 +73,7 @@ defmodule Ash.Policy.Authorizer do
     name: :authorize_if,
     describe: "If the check is true, the request is authorized, otherwise run remaining checks.",
     args: [:check],
+    depend_on_only_behaviour_modules: [:check],
     schema: @check_schema,
     examples: [
       "authorize_if logged_in()",
@@ -89,6 +90,7 @@ defmodule Ash.Policy.Authorizer do
     name: :forbid_if,
     describe: "If the check is true, the request is forbidden, otherwise run remaining checks.",
     args: [:check],
+    depend_on_only_behaviour_modules: [:check],
     schema: @check_schema,
     target: Ash.Policy.Check,
     transform: {Ash.Policy.Check, :transform, []},
@@ -105,6 +107,7 @@ defmodule Ash.Policy.Authorizer do
     name: :authorize_unless,
     describe: "If the check is true, run remaining checks, otherwise the request is authorized.",
     args: [:check],
+    depend_on_only_behaviour_modules: [:check],
     schema: @check_schema,
     target: Ash.Policy.Check,
     transform: {Ash.Policy.Check, :transform, []},
@@ -121,6 +124,7 @@ defmodule Ash.Policy.Authorizer do
     name: :forbid_unless,
     describe: "If the check is true, run remaining checks, otherwise the request is forbidden.",
     args: [:check],
+    depend_on_only_behaviour_modules: [:check],
     schema: @check_schema,
     target: Ash.Policy.Check,
     transform: {Ash.Policy.Check, :transform, []},
@@ -202,7 +206,7 @@ defmodule Ash.Policy.Authorizer do
     ],
     args: [{:optional, :condition}],
     target: Ash.Policy.Policy,
-    no_depend_modules: [:condition],
+    depend_on_only_behaviour_modules: [:condition],
     transform: {Ash.Policy.Policy, :transform, []},
     entities: [
       policies: [
@@ -262,7 +266,7 @@ defmodule Ash.Policy.Authorizer do
       ]
     ],
     args: [:condition],
-    no_depend_modules: [:condition],
+    depend_on_only_behaviour_modules: [:condition],
     recursive_as: :policies,
     entities: [
       policies: [
@@ -355,6 +359,7 @@ defmodule Ash.Policy.Authorizer do
       ]
     ],
     args: [:fields, {:optional, :condition}],
+    depend_on_only_behaviour_modules: [:condition],
     target: Ash.Policy.FieldPolicy,
     transform: {Ash.Policy.FieldPolicy, :transform, []},
     entities: [
@@ -489,6 +494,10 @@ defmodule Ash.Policy.Authorizer do
     Ash.Policy.Authorizer.Transformers.CacheFieldPolicies
   ]
 
+  @persisters [
+    Ash.Policy.Authorizer.Transformers.CachePolicyExpressions
+  ]
+
   @verifiers [
     Ash.Policy.Authorizer.Verifiers.VerifyInAuthorizers,
     Ash.Policy.Authorizer.Verifiers.VerifySatSolverImplementation,
@@ -499,6 +508,7 @@ defmodule Ash.Policy.Authorizer do
   use Spark.Dsl.Extension,
     sections: @sections,
     transformers: @transformers,
+    persisters: @persisters,
     verifiers: @verifiers
 
   @impl true
@@ -1116,9 +1126,44 @@ defmodule Ash.Policy.Authorizer do
            attribute: %struct{name: name},
            relationship_path: relationship_path
          } = ref,
-         %{stack: [{parent, _path, action, domain} | _]} = acc
+         acc
        )
        when struct in [Ash.Resource.Attribute, Ash.Resource.Aggregate, Ash.Resource.Calculation] do
+    replace_named_ref(name, relationship_path, ref, acc)
+  end
+
+  defp do_replace_ref(
+         %{
+           attribute: %Ash.Query.Calculation{calc_name: name},
+           relationship_path: relationship_path
+         } = ref,
+         acc
+       )
+       when is_atom(name) and not is_nil(name) do
+    replace_named_ref(name, relationship_path, ref, acc)
+  end
+
+  defp do_replace_ref(
+         %{
+           attribute: %Ash.Query.Aggregate{agg_name: name},
+           relationship_path: relationship_path
+         } = ref,
+         acc
+       )
+       when is_atom(name) and not is_nil(name) do
+    replace_named_ref(name, relationship_path, ref, acc)
+  end
+
+  defp do_replace_ref(ref, acc) do
+    {ref, acc}
+  end
+
+  defp replace_named_ref(
+         name,
+         relationship_path,
+         ref,
+         %{stack: [{parent, _path, action, domain} | _]} = acc
+       ) do
     resource = Ash.Resource.Info.related(parent, relationship_path)
 
     action =
@@ -1140,10 +1185,6 @@ defmodule Ash.Policy.Authorizer do
       end
 
     expression_for_ref(resource, name, action, domain, ref, acc)
-  end
-
-  defp do_replace_ref(ref, acc) do
-    {ref, acc}
   end
 
   defp related_with_action(resource, path) do
@@ -1170,6 +1211,9 @@ defmodule Ash.Policy.Authorizer do
         {ref, acc}
 
       {:expr, expr, acc} ->
+        # the field condition is relative to `resource`, so move it to the ref's path
+        expr = Ash.Filter.move_to_relationship_path(expr, ref.relationship_path)
+
         {Ash.Expr.expr(
            if ^expr do
              ^ref

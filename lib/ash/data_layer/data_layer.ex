@@ -16,6 +16,7 @@ defmodule Ash.DataLayer do
           %{
             required(:type) => :create,
             required(:metadata) => %{resource: Ash.Resource.t(), action: atom},
+            optional(:tenant) => term(),
             optional(:data_layer_context) => %{}
           }
           | %{
@@ -26,6 +27,7 @@ defmodule Ash.DataLayer do
                 record: Ash.Resource.Record.t(),
                 actor: term()
               },
+              optional(:tenant) => term(),
               optional(:data_layer_context) => %{}
             }
           | %{
@@ -36,6 +38,7 @@ defmodule Ash.DataLayer do
                 record: Ash.Resource.Record.t(),
                 actor: term()
               },
+              optional(:tenant) => term(),
               optional(:data_layer_context) => %{}
             }
           | %{
@@ -45,6 +48,7 @@ defmodule Ash.DataLayer do
                 query: Ash.Query.t(),
                 actor: term()
               },
+              optional(:tenant) => term(),
               optional(:data_layer_context) => %{}
             }
           | %{
@@ -55,6 +59,7 @@ defmodule Ash.DataLayer do
                 action: atom,
                 actor: term()
               },
+              optional(:tenant) => term(),
               optional(:data_layer_context) => %{}
             }
           | %{
@@ -64,16 +69,26 @@ defmodule Ash.DataLayer do
                 flow: module(),
                 actor: term()
               },
+              optional(:tenant) => term(),
               optional(:data_layer_context) => %{}
             }
-          | %{required(:type) => :custom, required(:metadata) => map()}
-          | %{required(:type) => atom, required(:metadata) => map()}
+          | %{
+              required(:type) => :custom,
+              required(:metadata) => map(),
+              optional(:tenant) => term()
+            }
+          | %{
+              required(:type) => atom,
+              required(:metadata) => map(),
+              optional(:tenant) => term()
+            }
 
   @type combination_type :: :union | :union_all | :intersection
 
   @type feature() ::
           :transact
           | :multitenancy
+          | :temporal
           | :combine
           | {:combine, combination_type}
           | {:atomic, :update}
@@ -159,6 +174,8 @@ defmodule Ash.DataLayer do
               resource :: Ash.Resource.t()
             ) :: {:ok, data_layer_query()} | {:error, term}
   @callback set_tenant(Ash.Resource.t(), data_layer_query(), term) ::
+              {:ok, data_layer_query()} | {:error, term}
+  @callback set_as_of(Ash.Resource.t(), data_layer_query(), DateTime.t()) ::
               {:ok, data_layer_query()} | {:error, term}
   @callback resource_to_query(Ash.Resource.t(), Ash.Domain.t()) :: data_layer_query()
   @callback transform_query(Ash.Query.t()) :: Ash.Query.t()
@@ -401,6 +418,7 @@ defmodule Ash.DataLayer do
                       run_aggregate_query_with_lateral_join: 5,
                       transform_query: 1,
                       set_tenant: 3,
+                      set_as_of: 3,
                       attribute_ecto_type: 2
 
   @doc "The data layer of the resource, or nil if it does not have one"
@@ -1031,6 +1049,19 @@ defmodule Ash.DataLayer do
       [{:ok, :_}, {:error, :_}],
       behaviour: __MODULE__,
       callback_name: "set_tenant/3"
+    )
+  end
+
+  @spec set_as_of(Ash.Resource.t(), data_layer_query(), DateTime.t()) ::
+          {:ok, data_layer_query()} | {:error, term}
+  def set_as_of(resource, query, as_of) do
+    Ash.BehaviourHelpers.call_and_validate_return(
+      Ash.DataLayer.data_layer(resource),
+      :set_as_of,
+      [resource, query, as_of],
+      [{:ok, :_}, {:error, :_}],
+      behaviour: __MODULE__,
+      callback_name: "set_as_of/3"
     )
   end
 

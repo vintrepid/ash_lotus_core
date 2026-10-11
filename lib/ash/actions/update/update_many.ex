@@ -122,7 +122,12 @@ defmodule Ash.Actions.Update.UpdateMany do
          atomic_notifications ++ manual_notifications}
       end,
       nil,
-      %{type: :bulk_update, metadata: %{resource: resource, action: action.name}}
+      %{
+        type: :bulk_update,
+        metadata: %{resource: resource, action: action.name},
+        tenant: opts[:tenant],
+        data_layer_context: opts[:data_layer_context] || %{}
+      }
     )
     |> case do
       {:ok, {records, errors, notifications}} -> {records, errors, notifications}
@@ -498,10 +503,7 @@ defmodule Ash.Actions.Update.UpdateMany do
         %{result | notifications: nil}
 
       Process.get(:ash_started_transaction?, false) ->
-        Process.put(
-          :ash_notifications,
-          List.wrap(Process.get(:ash_notifications)) ++ result.notifications
-        )
+        Ash.Actions.Helpers.queue_notifications(result.notifications)
 
         %{result | notifications: []}
 

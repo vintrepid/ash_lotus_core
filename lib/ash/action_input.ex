@@ -21,6 +21,7 @@ defmodule Ash.ActionInput do
     :resource,
     :tenant,
     :to_tenant,
+    :as_of,
     invalid_keys: MapSet.new(),
     arguments: %{},
     params: %{},
@@ -41,7 +42,7 @@ defmodule Ash.ActionInput do
 
   Receives an action input and returns a modified action input, optionally with notifications.
   """
-  @type before_action_fun :: (t -> t | {t, %{notifications: [Ash.Notifier.Notification.t()]}})
+  @type before_action_fun :: (t -> t | {t, Ash.Notifier.Notification.input()})
 
   @typedoc """
   Function type for after action hooks.
@@ -52,9 +53,9 @@ defmodule Ash.ActionInput do
   @type after_action_fun ::
           (t, term ->
              :ok
-             | {:ok, [Ash.Notifier.Notification.t()]}
+             | {:ok, Ash.Notifier.Notification.input()}
              | {:ok, term}
-             | {:ok, term, [Ash.Notifier.Notification.t()]}
+             | {:ok, term, Ash.Notifier.Notification.input()}
              | {:error, any})
 
   @typedoc """
@@ -95,6 +96,7 @@ defmodule Ash.ActionInput do
           arguments: map(),
           params: map(),
           tenant: term(),
+          as_of: DateTime.t() | Ash.Range.t() | :now | nil,
           action: Ash.Resource.Actions.Action.t() | nil,
           resource: Ash.Resource.t(),
           invalid_keys: MapSet.t(),
@@ -161,6 +163,10 @@ defmodule Ash.ActionInput do
     tenant: [
       type: :any,
       doc: "The tenant to use for the action."
+    ],
+    as_of: [
+      type: {:or, [{:struct, DateTime}, {:struct, Ash.Range}, {:literal, :now}, {:literal, nil}]},
+      doc: "A point in time to run the action \"as of\" (time travel). See `Ash.Query.as_of/2`."
     ],
     scope: [
       type: :any,
@@ -351,6 +357,21 @@ defmodule Ash.ActionInput do
   @spec set_tenant(t(), Ash.ToTenant.t()) :: t()
   def set_tenant(input, tenant) do
     %{input | tenant: tenant, to_tenant: Ash.ToTenant.to_tenant(tenant, input.resource)}
+  end
+
+  @doc """
+  Sets the `as_of` point in time on the action input (time travel).
+
+  Mirrors `Ash.Query.as_of/2`/`Ash.Changeset.as_of/2`: the value (a `DateTime`,
+  `:now`, or `nil`) is stored on the input and threaded into the action context so
+  generic action implementations can read it.
+  """
+  @spec set_as_of(t(), DateTime.t() | Ash.Range.t() | :now | nil) :: t()
+  def set_as_of(input, nil), do: input
+
+  def set_as_of(input, as_of) do
+    %{input | as_of: as_of}
+    |> set_context(%{private: %{as_of: as_of}, shared: %{as_of: as_of}})
   end
 
   @doc """
@@ -1081,8 +1102,17 @@ defmodule Ash.ActionInput do
       ...>     action: input.action,
       ...>     data: %{audit: "before_action"}
       ...>   }
-      ...>   {input, %{notifications: [notification]}}
+      ...>   {input, [notification]}
       ...> end)
+
+  A `before_action` hook may return notifications in any of these forms:
+
+    {input, notification}
+    {input, [notification]}
+    {input, %{notifications: [notification]}}
+    {input, nil}
+
+  Returning `input` without a tuple is equivalent to returning no notifications.
 
   ## Options
 
@@ -1120,7 +1150,7 @@ defmodule Ash.ActionInput do
   > After action hooks will work for generic actions without a return type,
   > however they will receive `nil` as their `result` argument and are
   > expected to return
-  > `:ok | {:ok, [Ash.Notifier.Notification.t()]} | {:error, term}`.
+  > `:ok | {:ok, Ash.Notifier.Notification.input()} | {:error, term}`.
 
   ## Examples
 
@@ -1151,6 +1181,14 @@ defmodule Ash.ActionInput do
       ...>   }
       ...>   {:ok, result, [notification]}
       ...> end)
+
+    The notification value may also be returned as a single notification,
+    a map containing a `:notifications` key, or `nil`:
+
+        {:ok, result, notification}
+        {:ok, result, [notification]}
+        {:ok, result, %{notifications: [notification]}}
+        {:ok, result, nil}
 
       # Handle errors
       iex> MyApp.Post
@@ -1602,7 +1640,9 @@ defmodule Ash.ActionInput do
           {:error, error} ->
             {:halt, {:error, error}}
 
-          {input, %{notifications: notifications}} ->
+          {%Ash.ActionInput{} = input, notification_input} ->
+            notifications = Ash.Notifier.Notification.normalize(notification_input)
+
             cont =
               if input.valid? do
                 :cont
@@ -1614,7 +1654,7 @@ defmodule Ash.ActionInput do
              {input,
               %{
                 instructions
-                | notifications: List.wrap(instructions.notifications) ++ List.wrap(notifications)
+                | notifications: List.wrap(instructions.notifications) ++ notifications
               }}}
 
           %Ash.ActionInput{} = input ->
@@ -1632,7 +1672,10 @@ defmodule Ash.ActionInput do
             Invalid return value from before_action hook. Expected one of:
 
             * %Ash.ActionInput{}
-            * {%Ash.ActionInput{}, %{notifications: [...]}}
+            * {%Ash.ActionInput{}, notification}
+            * {%Ash.ActionInput{}, [notification]}
+            * {%Ash.ActionInput{}, %{notifications: notifications}}
+            * {%Ash.ActionInput{}, nil}
             * {:error, error}
 
             Got:
@@ -1755,7 +1798,7 @@ defmodule Ash.ActionInput do
 
   defp merge_after_action_notifications(input, result, old_notifications, new_notifications) do
     Enum.map(
-      List.wrap(old_notifications) ++ List.wrap(new_notifications),
+      List.wrap(old_notifications) ++ Ash.Notifier.Notification.normalize(new_notifications),
       fn notification ->
         %{
           notification

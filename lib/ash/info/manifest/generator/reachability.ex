@@ -14,7 +14,7 @@ defmodule Ash.Info.Manifest.Generator.Reachability do
   Handles cycle detection via a visited set to prevent infinite recursion.
   """
 
-  alias Ash.Info.Manifest.Generator.TypeResolver
+  alias Ash.Info.Manifest.Generator.{ResourceBuilder, TypeResolver}
 
   @doc """
   Find all resources and standalone types reachable from the given resource modules.
@@ -93,7 +93,7 @@ defmodule Ash.Info.Manifest.Generator.Reachability do
       # Walk fields
       {field_resources, field_types, visited} =
         Enum.reduce(fields, {[], [], visited}, fn field, {resources, types, visited} ->
-          {type, constraints} = get_field_type_and_constraints(field)
+          {type, constraints} = get_field_type_and_constraints(resource, field)
 
           {found_r, found_t, new_visited} =
             traverse_type(type, constraints, visited, opts)
@@ -346,7 +346,7 @@ defmodule Ash.Info.Manifest.Generator.Reachability do
           is_resource?(type) ->
             traverse_resource_ref(type, visited, opts)
 
-          Code.ensure_loaded?(type) == true ->
+          TypeResolver.module_available?(type) ->
             traverse_field_constraints(constraints, visited, opts)
 
           true ->
@@ -437,7 +437,13 @@ defmodule Ash.Info.Manifest.Generator.Reachability do
     end
   end
 
-  defp get_field_type_and_constraints(field) do
+  # An aggregate's `type` is nil unless declared, so resolve it the same way the
+  # manifest field is built. Otherwise its type is never traversed.
+  defp get_field_type_and_constraints(resource, %Ash.Resource.Aggregate{} = aggregate) do
+    ResourceBuilder.resolve_aggregate_type(resource, aggregate)
+  end
+
+  defp get_field_type_and_constraints(_resource, field) do
     {Map.get(field, :type), Map.get(field, :constraints, []) || []}
   end
 
@@ -445,7 +451,7 @@ defmodule Ash.Info.Manifest.Generator.Reachability do
   defp calculation_arguments(_field), do: []
 
   defp is_resource?(module) when is_atom(module) do
-    Code.ensure_loaded?(module) == true and Ash.Resource.Info.resource?(module)
+    TypeResolver.module_available?(module) and Ash.Resource.Info.resource?(module)
   end
 
   defp is_resource?(_), do: false

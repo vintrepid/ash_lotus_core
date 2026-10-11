@@ -4,12 +4,14 @@
 
 defmodule Ash.Type.Range do
   @inner_types [:date, :integer, :naive_datetime, :datetime]
+  @inner_type_modules [Ash.Type.Date, Ash.Type.Integer, Ash.Type.NaiveDatetime, Ash.Type.DateTime]
 
   @constraints [
     inner_type: [
-      type: {:one_of, @inner_types},
+      type: {:custom, __MODULE__, :validate_inner_type, []},
       required: true,
-      doc: "The type of the range's bounds. One of #{inspect(@inner_types)}."
+      doc:
+        "The type of the range's bounds. One of #{inspect(@inner_types)}, or a `Ash.Type.NewType` of one of them, like `:utc_datetime_usec`."
     ],
     inner_constraints: [
       type: :keyword_list,
@@ -100,6 +102,28 @@ defmodule Ash.Type.Range do
   defp bound_lte?(%NaiveDateTime{} = a, b), do: NaiveDateTime.compare(a, b) != :gt
   defp bound_lte?(a, b), do: a <= b
 
+  @doc false
+  def validate_inner_type(type) do
+    if base_type(type) in @inner_type_modules do
+      {:ok, type}
+    else
+      {:error,
+       "expected one of #{inspect(@inner_types)}, or a NewType of one of them, got: #{inspect(type)}"}
+    end
+  end
+
+  @doc "The type a range's bounds are built from, looking through any `Ash.Type.NewType`."
+  @spec base_type(Ash.Type.t()) :: Ash.Type.t()
+  def base_type(type) do
+    type = Ash.Type.get_type(type)
+
+    if Ash.Type.NewType.new_type?(type) do
+      Ash.Type.get_type(Ash.Type.NewType.subtype_of(type))
+    else
+      type
+    end
+  end
+
   @impl true
   def init(constraints) do
     type = Ash.Type.get_type(constraints[:inner_type])
@@ -124,8 +148,33 @@ defmodule Ash.Type.Range do
 
   @impl true
   def referenced_types(constraints) do
-    type = Ash.Type.get_type(constraints[:inner_type])
-    [{type, constraints[:inner_constraints] || [], {:inner_type_of, :range}}]
+    case type_parameter(constraints) do
+      {type, inner_constraints} -> [{type, inner_constraints, {:inner_type_of, :range}}]
+      nil -> []
+    end
+  end
+
+  @impl true
+  def type_parameter(constraints) do
+    case constraints[:inner_type] do
+      nil -> nil
+      inner_type -> {Ash.Type.get_type(inner_type), constraints[:inner_constraints] || []}
+    end
+  end
+
+  @impl true
+  def with_type_parameter(constraints, {inner_type, inner_constraints}) do
+    inner_type = Ash.Type.get_type(inner_type)
+
+    # `inner_type` is validated against short names, so write the short name back.
+    inner_type =
+      Enum.find_value(Ash.Type.short_names(), inner_type, fn {short_name, module} ->
+        if module == inner_type, do: short_name
+      end)
+
+    constraints
+    |> Keyword.put(:inner_type, inner_type)
+    |> Keyword.put(:inner_constraints, inner_constraints)
   end
 
   @impl true
@@ -259,7 +308,7 @@ defmodule Ash.Type.Range do
     if empty_bounds?(range) do
       Range.empty()
     else
-      shifted = discrete_bounds(range, constraints[:inner_type])
+      shifted = discrete_bounds(range, base_type(constraints[:inner_type]))
 
       if empty_bounds?(shifted), do: Range.empty(), else: shifted
     end

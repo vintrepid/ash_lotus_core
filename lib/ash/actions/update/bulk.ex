@@ -287,7 +287,10 @@ defmodule Ash.Actions.Update.Bulk do
             {atomic_changeset, opts} =
               Ash.Actions.Helpers.set_context_and_get_opts(domain, atomic_changeset, opts)
 
-            atomic_changeset = Ash.Actions.Helpers.apply_opts_load(atomic_changeset, opts)
+            atomic_changeset =
+              atomic_changeset
+              |> Ash.Actions.Helpers.apply_opts_load(opts)
+              |> Ash.Actions.Helpers.refuse_load_over_range()
 
             atomic_changeset =
               if opts[:select] do
@@ -299,6 +302,7 @@ defmodule Ash.Actions.Update.Bulk do
             atomic_changeset = %{atomic_changeset | domain: domain}
 
             notify? = !Process.put(:ash_started_transaction?, true)
+            queued_notifications = Process.get(:ash_notifications)
 
             try do
               context =
@@ -368,6 +372,7 @@ defmodule Ash.Actions.Update.Bulk do
                         action: atomic_changeset.action.name,
                         actor: opts[:actor]
                       },
+                      tenant: opts[:tenant],
                       data_layer_context: opts[:data_layer_context] || %{}
                     },
                     rollback_on_error?: false
@@ -390,6 +395,7 @@ defmodule Ash.Actions.Update.Bulk do
                   {[{:error, error, atomic_changeset}], []}
 
                 {:error, error} ->
+                  Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
                   {[{:error, error, atomic_changeset}], []}
               end
               |> case do
@@ -449,6 +455,12 @@ defmodule Ash.Actions.Update.Bulk do
                   end
               end
               |> handle_atomic_notifications(atomic_changeset.resource, action, notify?, opts)
+            rescue
+              error ->
+                if notify?,
+                  do: Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
+
+                reraise error, __STACKTRACE__
             after
               if notify? do
                 Process.delete(:ash_started_transaction?)
@@ -565,6 +577,7 @@ defmodule Ash.Actions.Update.Bulk do
         if opts[:transaction] == :all &&
              Ash.DataLayer.data_layer_can?(resource, :transact) do
           notify? = !Process.put(:ash_started_transaction?, true)
+          queued_notifications = Process.get(:ash_notifications)
 
           try do
             Ash.DataLayer.transaction(
@@ -594,6 +607,7 @@ defmodule Ash.Actions.Update.Bulk do
                   action: action.name,
                   actor: opts[:actor]
                 },
+                tenant: opts[:tenant],
                 data_layer_context: opts[:data_layer_context] || %{}
               },
               rollback_on_error?: false
@@ -604,13 +618,14 @@ defmodule Ash.Actions.Update.Bulk do
                   if notify? do
                     notifications =
                       if opts[:return_notifications?] do
-                        bulk_result.notifications ++ List.wrap(Process.delete(:ash_notifications))
+                        bulk_result.notifications ++
+                          Ash.Actions.Helpers.take_queued_notifications()
                       else
                         if opts[:notify?] do
                           remaining_notifications =
                             Ash.Notifier.notify(
                               bulk_result.notifications ++
-                                List.wrap(Process.delete(:ash_notifications))
+                                Ash.Actions.Helpers.take_queued_notifications()
                             )
 
                           Ash.Actions.Helpers.warn_missed!(resource, action, %{
@@ -626,11 +641,7 @@ defmodule Ash.Actions.Update.Bulk do
                       | notifications: notifications
                     }
                   else
-                    Process.put(
-                      :ash_notifications,
-                      List.wrap(Process.get(:ash_notifications)) ++
-                        List.wrap(bulk_result.notifications)
-                    )
+                    Ash.Actions.Helpers.queue_notifications(bulk_result.notifications)
 
                     bulk_result
                   end
@@ -638,12 +649,20 @@ defmodule Ash.Actions.Update.Bulk do
                 handle_bulk_result(bulk_result, metadata_key, opts)
 
               {:error, error} ->
+                Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
+
                 handle_bulk_result(
                   %Ash.BulkResult{errors: [error], status: :error},
                   metadata_key,
                   opts
                 )
             end
+          rescue
+            error ->
+              if notify?,
+                do: Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
+
+              reraise error, __STACKTRACE__
           after
             if notify? do
               Process.delete(:ash_started_transaction?)
@@ -1021,11 +1040,20 @@ defmodule Ash.Actions.Update.Bulk do
 
   defp handle_atomic_notifications(bulk_result, resource, action, notify?, opts) do
     if opts[:return_notifications?] do
-      bulk_result
+      if notify? do
+        %{
+          bulk_result
+          | notifications:
+              Ash.Actions.Helpers.take_queued_notifications() ++
+                List.wrap(bulk_result.notifications)
+        }
+      else
+        bulk_result
+      end
     else
       if notify? do
         notifications =
-          List.wrap(Process.delete(:ash_notifications)) ++
+          Ash.Actions.Helpers.take_queued_notifications() ++
             List.wrap(bulk_result.notifications)
 
         if opts[:notify?] do
@@ -1040,12 +1068,7 @@ defmodule Ash.Actions.Update.Bulk do
           %{bulk_result | notifications: []}
         end
       else
-        process_notifications = List.wrap(Process.get(:ash_notifications, []))
-
-        Process.put(
-          :ash_notifications,
-          process_notifications ++ List.wrap(bulk_result.notifications)
-        )
+        Ash.Actions.Helpers.queue_notifications(bulk_result.notifications)
 
         %{bulk_result | notifications: []}
       end
@@ -1411,6 +1434,7 @@ defmodule Ash.Actions.Update.Bulk do
         |> Ash.Query.filter(^atomic_changeset.filter)
         |> Ash.Query.select([])
         |> Ash.Query.sort(opts[:query_sort] || [])
+        |> Ash.Actions.Helpers.unscope_write_read_as_of(atomic_changeset.as_of)
         |> then(fn query ->
           run(domain, query, action.name, input,
             actor: opts[:actor],
@@ -1474,6 +1498,34 @@ defmodule Ash.Actions.Update.Bulk do
   end
 
   defp do_stream_batches(
+         domain,
+         stream,
+         action,
+         input,
+         opts,
+         metadata_key,
+         ref_metadata_key,
+         context_key
+       ) do
+    case Ash.Actions.Helpers.refuse_stream_over_range(opts[:resource], action, opts[:as_of]) do
+      :ok ->
+        stream_batches(
+          domain,
+          stream,
+          action,
+          input,
+          opts,
+          metadata_key,
+          ref_metadata_key,
+          context_key
+        )
+
+      {:error, error} ->
+        %Ash.BulkResult{status: :error, error_count: 1, errors: [error]}
+    end
+  end
+
+  defp stream_batches(
          domain,
          stream,
          action,
@@ -1679,7 +1731,7 @@ defmodule Ash.Actions.Update.Bulk do
   end
 
   defp authorize_bulk_query(query, atomic_changeset, opts) do
-    if opts[:authorize?] && opts[:authorize_query?] do
+    if opts[:authorize?] && opts[:authorize_query?] && Ash.Actions.Helpers.authorizers?(query) do
       case Ash.can(query, opts[:actor],
              return_forbidden_error?: true,
              maybe_is: false,
@@ -1709,7 +1761,7 @@ defmodule Ash.Actions.Update.Bulk do
 
   @doc false
   def authorize_atomic_changeset(query, changeset, opts) do
-    if opts[:authorize?] do
+    if opts[:authorize?] && Ash.Actions.Helpers.authorizers?(changeset) do
       case Ash.can(
              changeset,
              opts[:actor],
@@ -1755,11 +1807,11 @@ defmodule Ash.Actions.Update.Bulk do
         argument =
           if is_binary(key) do
             Enum.find(action.arguments, fn arg ->
-              to_string(arg.name) == key
+              arg.public? && to_string(arg.name) == key
             end)
           else
             Enum.find(action.arguments, fn arg ->
-              arg.name == key
+              arg.public? && arg.name == key
             end)
           end
 
@@ -1992,6 +2044,7 @@ defmodule Ash.Actions.Update.Bulk do
       context = batch |> Enum.at(0) |> Kernel.||(%{}) |> Map.get(:context)
 
       notify? = opts[:notify?] && !Process.put(:ash_started_transaction?, true)
+      queued_notifications = Process.get(:ash_notifications)
 
       try do
         Ash.DataLayer.transaction(
@@ -2021,6 +2074,7 @@ defmodule Ash.Actions.Update.Bulk do
               action: action.name,
               actor: opts[:actor]
             },
+            tenant: opts[:tenant],
             data_layer_context: opts[:data_layer_context] || context
           },
           rollback_on_error?: false
@@ -2056,6 +2110,8 @@ defmodule Ash.Actions.Update.Bulk do
             end)
 
           {:error, error} ->
+            Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
+
             # Convert batch changesets to error tuples for after_transaction processing
             error_tagged_results =
               Enum.map(batch, fn changeset ->
@@ -2088,12 +2144,15 @@ defmodule Ash.Actions.Update.Bulk do
               end
             end)
         end
+      rescue
+        error ->
+          if notify?, do: Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
+          reraise error, __STACKTRACE__
       after
         if notify? do
           Process.delete(:ash_started_transaction?)
-          notifications = Process.get(:ash_notifications, [])
+          notifications = Ash.Actions.Helpers.take_queued_notifications()
           remaining_notifications = Ash.Notifier.notify(notifications)
-          Process.delete(:ash_notifications) || []
 
           Ash.Actions.Helpers.warn_missed!(resource, action, %{
             resource_notifications: remaining_notifications
@@ -2281,7 +2340,7 @@ defmodule Ash.Actions.Update.Bulk do
 
           notifications =
             if opts[:notify?] do
-              process_notifications = Process.get(:ash_notifications, [])
+              process_notifications = Ash.Actions.Helpers.peek_queued_notifications()
               bulk_notifications = Process.get({:bulk_notifications, ref}) || []
 
               if opts[:return_notifications?] do
@@ -2521,7 +2580,7 @@ defmodule Ash.Actions.Update.Bulk do
   end
 
   defp authorize(batch, opts) do
-    if opts[:authorize?] do
+    if opts[:authorize?] && Ash.Actions.Helpers.authorizers?(batch) do
       batch
       |> Enum.map(fn changeset ->
         if changeset.valid? do
@@ -3004,6 +3063,13 @@ defmodule Ash.Actions.Update.Bulk do
                       do: Map.put(metadata, :tenant, changeset.to_tenant),
                       else: metadata
 
+                  metadata =
+                    Ash.Actions.Helpers.put_write_as_of(
+                      metadata,
+                      changeset.resource,
+                      changeset.as_of
+                    )
+
                   {[Ash.Resource.set_metadata(result, metadata)],
                    Map.put(changeset_map, changeset_id, changeset)}
                 else
@@ -3052,6 +3118,9 @@ defmodule Ash.Actions.Update.Bulk do
                 do: Map.put(metadata, :tenant, changeset.to_tenant),
                 else: metadata
 
+            metadata =
+              Ash.Actions.Helpers.put_write_as_of(metadata, changeset.resource, changeset.as_of)
+
             {[Ash.Resource.set_metadata(result, metadata)],
              Map.put(changeset_map, changeset_id, changeset)}
           else
@@ -3078,6 +3147,13 @@ defmodule Ash.Actions.Update.Bulk do
                     if changeset.to_tenant,
                       do: Map.put(metadata, :tenant, changeset.to_tenant),
                       else: metadata
+
+                  metadata =
+                    Ash.Actions.Helpers.put_write_as_of(
+                      metadata,
+                      changeset.resource,
+                      changeset.as_of
+                    )
 
                   {[Ash.Resource.set_metadata(result, metadata)],
                    Map.put(changeset_map, changeset_id, changeset)}

@@ -217,7 +217,7 @@ defmodule Ash.Actions.Create do
   end
 
   defp authorize(changeset, opts) do
-    if opts[:authorize?] do
+    if opts[:authorize?] && Ash.Actions.Helpers.authorizers?(changeset) do
       case Ash.can(changeset, opts[:actor],
              alter_source?: true,
              pre_flight?: true,
@@ -241,11 +241,14 @@ defmodule Ash.Actions.Create do
   defp add_tenant({:ok, nil}, _), do: {:ok, nil}
 
   defp add_tenant({:ok, data}, changeset) do
-    if changeset.tenant do
-      {:ok, %{data | __metadata__: Map.put(data.__metadata__, :tenant, changeset.tenant)}}
-    else
-      {:ok, data}
-    end
+    metadata =
+      data.__metadata__
+      |> then(fn metadata ->
+        if changeset.tenant, do: Map.put(metadata, :tenant, changeset.tenant), else: metadata
+      end)
+      |> Ash.Actions.Helpers.put_write_as_of(changeset.resource, changeset.as_of)
+
+    {:ok, %{data | __metadata__: metadata}}
   end
 
   defp add_tenant(other, _), do: other
