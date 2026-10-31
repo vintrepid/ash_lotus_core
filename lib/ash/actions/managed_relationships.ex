@@ -2040,10 +2040,25 @@ defmodule Ash.Actions.ManagedRelationships do
             context: query.context
           )
 
-        Ash.Query.do_filter(query, filter, parent_stack: relationship.source)
+        Ash.Query.do_filter(
+          query,
+          Ash.Actions.Read.RelatedAuthorization.trusted_filter(
+            relationship.destination,
+            filter,
+            relationship.source
+          ),
+          parent_stack: relationship.source
+        )
       end
 
-    Ash.Query.sort(query, relationship.sort, prepend?: true)
+    Ash.Query.sort(
+      query,
+      Ash.Actions.Read.RelatedAuthorization.trusted_sort(
+        relationship.destination,
+        relationship.sort
+      ),
+      prepend?: true
+    )
   end
 
   defp do_handle_found(
@@ -2775,7 +2790,7 @@ defmodule Ash.Actions.ManagedRelationships do
          {:ok, input_val} when not is_nil(input_val) <- fetch_field(input, field),
          {:ok, current_val} <- Ash.Type.cast_input(type, current_val, constraints),
          {:ok, input_val} <- Ash.Type.cast_input(type, input_val, constraints) do
-      Ash.Type.equal?(type, current_val, input_val)
+      Ash.Type.equal?(type, current_val, input_val, constraints)
     else
       _ ->
         false

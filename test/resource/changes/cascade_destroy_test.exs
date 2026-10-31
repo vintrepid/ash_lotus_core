@@ -55,6 +55,11 @@ defmodule Ash.Test.Resource.Change.CascadeDestroy do
                )
       end
 
+      destroy :destroy_posts_before do
+        require_atomic? false
+        change cascade_destroy(:posts, after_action?: false)
+      end
+
       destroy :destroy_tags_with_read_action do
         require_atomic? false
 
@@ -92,6 +97,7 @@ defmodule Ash.Test.Resource.Change.CascadeDestroy do
 
     attributes do
       uuid_primary_key :id
+      attribute :locked, :boolean, default: false, public?: true
     end
 
     actions do
@@ -113,6 +119,8 @@ defmodule Ash.Test.Resource.Change.CascadeDestroy do
       destroy :destroy do
         primary? true
         require_atomic? false
+
+        validate attribute_equals(:locked, false), message: "is locked"
 
         change before_action(fn changeset, _ ->
                  Agent.update(
@@ -210,6 +218,64 @@ defmodule Ash.Test.Resource.Change.CascadeDestroy do
     end
   end
 
+  defmodule TemporalParent do
+    @moduledoc false
+    use Ash.Resource, domain: Domain, data_layer: Ash.DataLayer.Ets
+
+    ets do
+      private? true
+    end
+
+    temporal do
+      strategy :context
+      attribute :valid_at
+    end
+
+    attributes do
+      attribute :id, :integer, primary_key?: true, allow_nil?: false, public?: true
+    end
+
+    relationships do
+      has_many :children, Test.TemporalChild do
+        no_attributes? true
+        filter expr(parent_id == parent(id))
+        temporal_keys {:valid_at, :valid_at}
+      end
+    end
+
+    actions do
+      defaults [:read, create: [:id]]
+
+      destroy :destroy do
+        primary? true
+        change cascade_destroy(:children, after_action?: false)
+      end
+    end
+  end
+
+  defmodule TemporalChild do
+    @moduledoc false
+    use Ash.Resource, domain: Domain, data_layer: Ash.DataLayer.Ets
+
+    ets do
+      private? true
+    end
+
+    temporal do
+      strategy :context
+      attribute :valid_at
+    end
+
+    attributes do
+      attribute :id, :integer, primary_key?: true, allow_nil?: false, public?: true
+      attribute :parent_id, :integer, public?: true
+    end
+
+    actions do
+      defaults [:read, :destroy, create: [:id, :parent_id]]
+    end
+  end
+
   setup do
     {:ok, pid} =
       start_supervised(
@@ -238,6 +304,45 @@ defmodule Ash.Test.Resource.Change.CascadeDestroy do
 
     assert [] = Post.read!()
     assert [] = Author.read!()
+  end
+
+  describe "when a related record can't be destroyed" do
+    setup do
+      author = Author.create!(%{})
+      Post.create!(%{author_id: author.id, locked: true})
+
+      # ETS has no transactions, so these are left behind
+      on_exit(fn ->
+        Ash.DataLayer.Ets.stop(Post)
+        Ash.DataLayer.Ets.stop(Author)
+      end)
+
+      %{author: author}
+    end
+
+    test "the destroy returns the error", %{author: author} do
+      assert {:error, %Ash.Error.Invalid{} = error} = Author.destroy(author)
+      assert Exception.message(error) =~ "is locked"
+    end
+
+    test "a bulk destroy returns the error", %{author: author} do
+      assert %Ash.BulkResult{status: :error, errors: [error | _]} =
+               Ash.bulk_destroy([author], :destroy, %{}, return_errors?: true)
+
+      assert Exception.message(error) =~ "is locked"
+    end
+
+    test "the destroy returns the error when destroying related records first", %{
+      author: author
+    } do
+      assert {:error, %Ash.Error.Invalid{} = error} =
+               author
+               |> Ash.Changeset.for_destroy(:destroy_posts_before)
+               |> Ash.destroy()
+
+      assert Exception.message(error) =~ "is locked"
+      assert [_] = Author.read!()
+    end
   end
 
   test "destroyed records are notified" do
@@ -323,5 +428,71 @@ defmodule Ash.Test.Resource.Change.CascadeDestroy do
     assert Agent.get(Test.Agent, & &1.custom_read_used) == true
 
     assert [] = Tag.read!()
+  end
+
+  describe "on a temporal resource" do
+    @jan ~U[2026-01-01 00:00:00.000000Z]
+    @feb ~U[2026-02-01 00:00:00.000000Z]
+    @mar ~U[2026-03-01 00:00:00.000000Z]
+    @apr ~U[2026-04-01 00:00:00.000000Z]
+    @probes [
+      ~U[2026-01-15 00:00:00.000000Z],
+      ~U[2026-02-15 00:00:00.000000Z],
+      ~U[2026-03-15 00:00:00.000000Z],
+      ~U[2026-04-15 00:00:00.000000Z]
+    ]
+
+    setup do
+      TemporalParent
+      |> Ash.Changeset.for_create(:create, %{id: 1}, as_of: @jan)
+      |> Ash.create!()
+
+      TemporalChild
+      |> Ash.Changeset.for_create(:create, %{id: 2, parent_id: 1}, as_of: @feb)
+      |> Ash.create!()
+
+      :ok
+    end
+
+    defp timeline(resource) do
+      for at <- @probes, do: resource |> Ash.read!(as_of: at) |> length()
+    end
+
+    defp temporal_parent do
+      [parent] = TemporalParent |> Ash.read!(as_of: ~U[2026-03-15 00:00:00.000000Z])
+      parent
+    end
+
+    defp destroy_temporal_parent(as_of, :option),
+      do:
+        temporal_parent()
+        |> Ash.Changeset.for_destroy(:destroy, %{}, as_of: as_of)
+        |> Ash.destroy!()
+
+    defp destroy_temporal_parent(as_of, :set_after),
+      do:
+        temporal_parent()
+        |> Ash.Changeset.for_destroy(:destroy)
+        |> Ash.Changeset.as_of(as_of)
+        |> Ash.destroy!()
+
+    for form <- [:option, :set_after] do
+      test "with as_of given as #{form}, the child is destroyed from the parent's as_of" do
+        destroy_temporal_parent(@mar, unquote(form))
+
+        assert timeline(TemporalParent) == [1, 1, 0, 0]
+        assert timeline(TemporalChild) == [0, 1, 0, 0]
+      end
+
+      test "with as_of given as #{form}, a range carves the child over the same span" do
+        destroy_temporal_parent(
+          %Ash.Range{lower: @mar, upper: @apr, bounds: :"[)"},
+          unquote(form)
+        )
+
+        assert timeline(TemporalParent) == [1, 1, 0, 1]
+        assert timeline(TemporalChild) == [0, 1, 0, 1]
+      end
+    end
   end
 end

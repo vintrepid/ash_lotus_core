@@ -95,6 +95,10 @@ defmodule Ash.Resource.Change.CascadeDestroy do
 
   """
   use Ash.Resource.Change
+
+  @impl true
+  def temporal_safe?(_opts), do: true
+
   import Ash.Gettext
   require Ash.Query
 
@@ -106,9 +110,11 @@ defmodule Ash.Resource.Change.CascadeDestroy do
       if not opts.after_action? and
            opts.relationship.type in [:many_to_many, :has_many, :has_one] do
         Ash.Changeset.before_action(changeset, fn changeset ->
-          # can't produce `{:error, error}` because `changeset.phase` is before_action
           case {destroy_related([changeset.data], opts, context, changeset),
                 opts.return_notifications?} do
+            {{:error, error}, _} ->
+              Ash.Changeset.add_error(changeset, error)
+
             {_, false} ->
               changeset
 
@@ -304,21 +310,15 @@ defmodule Ash.Resource.Change.CascadeDestroy do
       })
 
     context_opts =
-      Keyword.update(
-        context_opts,
-        :context,
-        action_context,
-        &Map.merge(&1, action_context)
-      )
+      Keyword.update(context_opts, :context, action_context, &Map.merge(&1, action_context))
+
+    destroy_opts = with_as_of(context_opts, changeset, relationship.destination)
 
     case related_query(data, opts, context_opts) do
       {:ok, query} ->
-        Ash.bulk_destroy!(
-          query,
-          action.name,
-          %{},
-          context_opts
-        )
+        query
+        |> Ash.bulk_destroy(action.name, %{}, destroy_opts)
+        |> handle_bulk_result()
 
       :error ->
         if changeset.phase == :after_action and changeset.action_type == :destroy do
@@ -349,28 +349,58 @@ defmodule Ash.Resource.Change.CascadeDestroy do
 
           data
           |> List.wrap()
-          |> Ash.load!(
-            [{relationship.name, load_query}],
-            scope: context
-          )
-          |> Enum.flat_map(fn record ->
-            record
-            |> Map.get(relationship.name)
-            |> List.wrap()
-          end)
-          |> Ash.bulk_destroy!(
-            action.name,
-            %{},
-            Keyword.update(
-              context_opts,
-              :context,
-              action_context,
-              &Map.merge(&1, action_context)
-            )
-          )
+          |> Ash.load([{relationship.name, load_query}], scope: context)
+          |> case do
+            {:ok, data} ->
+              data
+              |> Enum.flat_map(fn record ->
+                record
+                |> Map.get(relationship.name)
+                |> List.wrap()
+              end)
+              |> Ash.bulk_destroy(
+                action.name,
+                %{},
+                Keyword.update(
+                  destroy_opts,
+                  :context,
+                  action_context,
+                  &Map.merge(&1, action_context)
+                )
+              )
+              |> handle_bulk_result()
+
+            {:error, error} ->
+              {:error, error}
+          end
         end
     end
   end
+
+  defp handle_bulk_result(%Ash.BulkResult{status: :success} = result), do: result
+
+  defp handle_bulk_result(%Ash.BulkResult{errors: errors}),
+    do: {:error, Ash.Error.to_error_class(errors || [])}
+
+  # The destroys carry the changeset's own `as_of`, which may be a range or set after the
+  # change ran; the read that finds them does not.
+  defp with_as_of(context_opts, %{as_of: as_of}, destination) when not is_nil(as_of) do
+    if Ash.Resource.Info.temporal?(destination) do
+      context_opts
+      |> Keyword.put(:as_of, as_of)
+      |> Keyword.update(:context, %{}, &drop_shared_as_of/1)
+    else
+      context_opts
+    end
+  end
+
+  defp with_as_of(context_opts, _changeset, _destination), do: context_opts
+
+  # `shared` carries only the instant a range resolves to, and would narrow the range on the way in.
+  defp drop_shared_as_of(%{shared: %{} = shared} = context),
+    do: %{context | shared: Map.delete(shared, :as_of)}
+
+  defp drop_shared_as_of(context), do: context
 
   defp related_query(_records, opts, _) when opts.relationship.type == :many_to_many, do: :error
 

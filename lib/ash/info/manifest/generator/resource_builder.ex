@@ -67,7 +67,7 @@ defmodule Ash.Info.Manifest.Generator.ResourceBuilder do
         writable?: attr.writable?,
         has_default?: not is_nil(attr.default),
         description: Map.get(attr, :description),
-        filterable?: filterable?,
+        filterable?: filterable? != false,
         sortable?: Map.get(attr, :sortable?, true),
         primary_key?: attr.primary_key?,
         sensitive?: Map.get(attr, :sensitive?, false),
@@ -105,7 +105,7 @@ defmodule Ash.Info.Manifest.Generator.ResourceBuilder do
         writable?: false,
         has_default?: false,
         description: Map.get(calc, :description),
-        filterable?: filterable?,
+        filterable?: filterable? != false,
         sortable?: Map.get(calc, :sortable?, true),
         primary_key?: false,
         sensitive?: Map.get(calc, :sensitive?, false),
@@ -132,7 +132,7 @@ defmodule Ash.Info.Manifest.Generator.ResourceBuilder do
         writable?: false,
         has_default?: false,
         description: Map.get(aggregate, :description),
-        filterable?: filterable?,
+        filterable?: filterable? != false,
         sortable?: Map.get(aggregate, :sortable?, true),
         primary_key?: false,
         sensitive?: false,
@@ -152,12 +152,24 @@ defmodule Ash.Info.Manifest.Generator.ResourceBuilder do
     }
   end
 
-  defp resolve_filter_lists(field, true, _type, nil, _data_layer) do
+  defp resolve_filter_lists(field, mode, _type, nil, _data_layer)
+       when mode in [true, :simple_equality] do
     %{
       field
       | filter_operators: nil,
         filter_functions: nil,
         filter_custom_expressions: nil
+    }
+  end
+
+  defp resolve_filter_lists(field, :simple_equality, type, capabilities, data_layer) do
+    {operators, _functions} = OperatorResolver.resolve(type, capabilities, data_layer)
+
+    %{
+      field
+      | filter_operators: Enum.filter(operators, &(&1.name == :==)),
+        filter_functions: [],
+        filter_custom_expressions: []
     }
   end
 
@@ -173,21 +185,11 @@ defmodule Ash.Info.Manifest.Generator.ResourceBuilder do
     }
   end
 
-  defp resolve_aggregate_type(resource, aggregate) do
-    field =
-      if aggregate.field do
-        related = Ash.Resource.Info.related(resource, aggregate.relationship_path)
-
-        if related do
-          Ash.Resource.Info.attribute(related, aggregate.field) ||
-            Ash.Resource.Info.calculation(related, aggregate.field)
-        end
-      end
-
-    field_type = if field, do: field.type
-    field_constraints = if field, do: Map.get(field, :constraints, []), else: []
-
-    case Ash.Query.Aggregate.kind_to_type(aggregate.kind, field_type, field_constraints) do
+  @doc false
+  @spec resolve_aggregate_type(Ash.Resource.t(), Ash.Resource.Aggregate.t()) ::
+          {Ash.Type.t() | nil, Keyword.t()}
+  def resolve_aggregate_type(resource, aggregate) do
+    case Ash.Query.Aggregate.aggregate_type(resource, aggregate) do
       {:ok, type, constraints} -> {type, constraints}
       _other -> {aggregate.type, aggregate.constraints || []}
     end

@@ -209,6 +209,8 @@ defmodule Ash.Test.Actions.LoadTest do
       end
 
       calculate :campaign_upcase, :string, Ash.Test.Actions.LoadTest.UpcaseName
+      calculate :tracked_campaign_upcase, :string, Ash.Test.Actions.LoadTest.TrackedUpcaseName
+      calculate :exclaim_name, :string, Ash.Test.Actions.LoadTest.ExclaimName
 
       calculate :posts_calc, :struct, PostsWithACalc do
         constraints instance_of: Ash.Test.Actions.LoadTest.Post
@@ -223,6 +225,11 @@ defmodule Ash.Test.Actions.LoadTest do
       has_many(:posts, Ash.Test.Actions.LoadTest.Post,
         destination_attribute: :author_id,
         public?: true
+      )
+
+      has_many(:other_posts, Ash.Test.Actions.LoadTest.Post,
+        public?: true,
+        destination_attribute: :author_id
       )
 
       has_one(:latest_post, Ash.Test.Actions.LoadTest.Post,
@@ -240,6 +247,20 @@ defmodule Ash.Test.Actions.LoadTest do
     end
   end
 
+  defmodule TrackedUpcaseName do
+    @moduledoc "Like `UpcaseName`, but tells the test process every time it runs."
+    use Ash.Resource.Calculation
+
+    @impl true
+    def load(_, _, _), do: [campaign: :name]
+
+    @impl true
+    def calculate(authors, _, _) do
+      send(self(), {:calculated, __MODULE__})
+      Enum.map(authors, &String.upcase(to_string(&1.campaign.name)))
+    end
+  end
+
   defmodule UpcaseName do
     use Ash.Resource.Calculation
 
@@ -254,6 +275,14 @@ defmodule Ash.Test.Actions.LoadTest do
         |> String.upcase()
       end)
     end
+  end
+
+  defmodule ExclaimName do
+    @moduledoc "An expression-only calculation, with no `calculate/3`."
+    use Ash.Resource.Calculation
+
+    @impl true
+    def expression(_, _), do: expr(name <> "!")
   end
 
   defmodule PostsInSameCategory do
@@ -308,6 +337,22 @@ defmodule Ash.Test.Actions.LoadTest do
           offset? true
           default_limit 20
           countable :by_default
+        end
+      end
+
+      read :paginated_with_hook do
+        prepare after_action(fn query, results, _context ->
+                  if pid = query.context[:test_pid] do
+                    send(pid, {:after_action_count, length(results)})
+                  end
+
+                  {:ok, results}
+                end)
+
+        pagination do
+          required? false
+          keyset? true
+          offset? true
         end
       end
 
@@ -687,6 +732,12 @@ defmodule Ash.Test.Actions.LoadTest do
       assert {:ok, [%Post{title: "post1"}]} = Ash.load({:ok, [post]}, [])
     end
 
+    test "expression calculations on a record missing from the data layer are evaluated in memory" do
+      author = %Author{id: Ash.UUID.generate(), name: "zach"}
+
+      assert %{exclaim_name: "zach!"} = Ash.load!(author, :exclaim_name, authorize?: false)
+    end
+
     test "it allows loading manual relationships" do
       post1 =
         Post
@@ -1035,6 +1086,42 @@ defmodule Ash.Test.Actions.LoadTest do
       |> Ash.Query.load([:posts])
       |> Ash.read!(authorize?: true)
       |> Ash.load!([posts: :author], lazy?: true)
+    end
+
+    test "lazy?: true does not recompute or requery an already loaded calculation" do
+      campaign = Ash.create!(Ash.Changeset.for_create(Campaign, :create, %{name: "spring"}))
+
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "zerg"})
+        |> Ash.Changeset.manage_relationship(:campaign, campaign, type: :append_and_remove)
+        |> Ash.create!()
+        |> Ash.load!([:tracked_campaign_upcase, :campaign])
+
+      assert author.tracked_campaign_upcase == "SPRING"
+      assert_received {:calculated, TrackedUpcaseName}
+
+      run_query = {Ash.DataLayer.Ets, :run_query, 2}
+      Code.ensure_loaded!(Ash.DataLayer.Ets)
+      :erlang.trace_pattern(run_query, true, [:call_count])
+      on_exit(fn -> :erlang.trace_pattern(run_query, false, [:call_count]) end)
+
+      reloaded = Ash.load!(author, [:tracked_campaign_upcase, :campaign], lazy?: true)
+
+      assert reloaded.tracked_campaign_upcase == "SPRING"
+      assert reloaded.campaign.id == campaign.id
+      refute_received {:calculated, TrackedUpcaseName}
+      assert {:call_count, 0} = :erlang.trace_info(run_query, :call_count)
+
+      # a field the record does not have yet is still loaded, keeping the rest
+      with_more = Ash.load!(author, [:campaign_upcase], lazy?: true)
+      assert with_more.campaign_upcase == "SPRING"
+      assert with_more.tracked_campaign_upcase == "SPRING"
+      refute_received {:calculated, TrackedUpcaseName}
+
+      # without lazy?, the calculation runs again
+      Ash.load!(author, [:tracked_campaign_upcase])
+      assert_received {:calculated, TrackedUpcaseName}
     end
 
     test "loading something already loaded still loads it unless lazy?: true" do
@@ -1439,6 +1526,20 @@ defmodule Ash.Test.Actions.LoadTest do
       assert author.latest_post.id == post2.id
     end
 
+    test "a has_one with a sort loaded with a limit of 0 is nil" do
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "zerg"})
+        |> Ash.create!()
+
+      Post
+      |> Ash.Changeset.for_create(:create, %{title: "post1"})
+      |> Ash.Changeset.manage_relationship(:author, author, type: :append_and_remove)
+      |> Ash.create!()
+
+      assert is_nil(Ash.load!(author, latest_post: Ash.Query.limit(Post, 0)).latest_post)
+    end
+
     test "it throws an error when passing it an Ash.Query" do
       assert_raise ArgumentError, ~r/Ash.load expects a record or records/, fn ->
         Post
@@ -1715,6 +1816,150 @@ defmodule Ash.Test.Actions.LoadTest do
       )
 
       :ok
+    end
+
+    defp create_authors_with_posts(counts) do
+      for {name, post_count} <- counts do
+        author =
+          Author
+          |> Ash.Changeset.for_create(:create, %{name: name})
+          |> Ash.create!()
+
+        for i <- 1..post_count//1 do
+          Post
+          |> Ash.Changeset.for_create(:create, %{
+            title: "#{name} post#{i}",
+            author_id: author.id
+          })
+          |> Ash.create!()
+        end
+
+        author
+      end
+    end
+
+    defp hooked_posts_query(opts) do
+      Post
+      |> Ash.Query.for_read(:paginated_with_hook)
+      |> Ash.Query.set_context(%{test_pid: self()})
+      |> Ash.Query.page(opts)
+      |> Ash.Query.sort(:title)
+    end
+
+    defp after_action_counts do
+      receive do
+        {:after_action_count, count} -> [count | after_action_counts()]
+      after
+        0 -> []
+      end
+    end
+
+    test "after_action hooks only see each parent's own page, not the extra row" do
+      create_authors_with_posts([{"a", 5}, {"b", 5}, {"c", 5}])
+
+      assert [author_a, author_b, author_c] =
+               Author
+               |> Ash.Query.sort(:name)
+               |> Ash.Query.load(posts: hooked_posts_query(limit: 2, offset: 0))
+               |> Ash.read!()
+
+      # Three parents, two posts each -- not 3 x (2 + 1).
+      assert after_action_counts() == [6]
+
+      for {author, name} <- [{author_a, "a"}, {author_b, "b"}, {author_c, "c"}] do
+        assert %Ash.Page.Offset{more?: true} = author.posts
+
+        assert Enum.map(author.posts.results, & &1.title) == [
+                 "#{name} post1",
+                 "#{name} post2"
+               ]
+      end
+    end
+
+    test "parents with differing numbers of children each get their own page" do
+      create_authors_with_posts([{"a", 1}, {"b", 5}, {"c", 0}])
+
+      assert [author_a, author_b, author_c] =
+               Author
+               |> Ash.Query.sort(:name)
+               |> Ash.Query.load(posts: hooked_posts_query(limit: 2, offset: 0))
+               |> Ash.read!()
+
+      # "a" has a single post, "b" gets a full page, "c" has none.
+      assert after_action_counts() == [3]
+
+      assert %Ash.Page.Offset{more?: false} = author_a.posts
+      assert Enum.map(author_a.posts.results, & &1.title) == ["a post1"]
+
+      assert %Ash.Page.Offset{more?: true} = author_b.posts
+      assert Enum.map(author_b.posts.results, & &1.title) == ["b post1", "b post2"]
+
+      assert %Ash.Page.Offset{results: [], more?: false} = author_c.posts
+    end
+
+    test "keyset relationship pagination keeps per-parent ordering" do
+      create_authors_with_posts([{"a", 5}, {"b", 5}])
+
+      assert [author_a, author_b] =
+               Author
+               |> Ash.Query.sort(:name)
+               |> Ash.Query.load(posts: hooked_posts_query(limit: 3))
+               |> Ash.read!()
+
+      assert after_action_counts() == [6]
+
+      assert %Ash.Page.Keyset{more?: true} = author_a.posts
+
+      assert Enum.map(author_a.posts.results, & &1.title) == [
+               "a post1",
+               "a post2",
+               "a post3"
+             ]
+
+      assert Enum.map(author_b.posts.results, & &1.title) == [
+               "b post1",
+               "b post2",
+               "b post3"
+             ]
+    end
+
+    test "two paginated relationship loads on the same parent don't interfere" do
+      create_authors_with_posts([{"a", 5}])
+
+      assert [author] =
+               Author
+               |> Ash.Query.load(
+                 posts: hooked_posts_query(limit: 2, offset: 0),
+                 other_posts: hooked_posts_query(limit: 4, offset: 0)
+               )
+               |> Ash.read!()
+
+      # Two separate destination reads, each with its own extra row.
+      assert Enum.sort(after_action_counts()) == [2, 4]
+
+      assert %Ash.Page.Offset{more?: true} = author.posts
+      assert Enum.map(author.posts.results, & &1.title) == ["a post1", "a post2"]
+
+      assert %Ash.Page.Offset{more?: true} = author.other_posts
+
+      assert Enum.map(author.other_posts.results, & &1.title) == [
+               "a post1",
+               "a post2",
+               "a post3",
+               "a post4"
+             ]
+    end
+
+    test "a relationship load whose last page is exact reports more?: false" do
+      create_authors_with_posts([{"a", 4}])
+
+      assert [author] =
+               Author
+               |> Ash.Query.load(posts: hooked_posts_query(limit: 4, offset: 0))
+               |> Ash.read!()
+
+      assert after_action_counts() == [4]
+      assert %Ash.Page.Offset{more?: false} = author.posts
     end
 
     test "it allows paginating has_many relationships with offset pagination" do
@@ -2303,6 +2548,110 @@ defmodule Ash.Test.Actions.LoadTest do
     end
   end
 
+  describe "strict?: true on write actions" do
+    setup do
+      author =
+        Author
+        |> Ash.Changeset.for_create(:create, %{name: "a"})
+        |> Ash.create!()
+
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "post", author_id: author.id})
+        |> Ash.create!()
+
+      %{author: author, post: post}
+    end
+
+    defp assert_strict_author(post) do
+      assert post.author.name == "a"
+      assert %Ash.NotLoaded{} = post.author.bio
+    end
+
+    test "create only loads specified fields on related resource", %{author: author} do
+      Post
+      |> Ash.create!(%{title: "new", author_id: author.id},
+        load: [author: [:name]],
+        strict?: true
+      )
+      |> assert_strict_author()
+
+      Post
+      |> Ash.Changeset.for_create(:create, %{title: "new", author_id: author.id})
+      |> Ash.create!(load: [author: [:name]], strict?: true)
+      |> assert_strict_author()
+
+      Post
+      |> Ash.Changeset.for_create(:create, %{title: "new", author_id: author.id})
+      |> Ash.Changeset.load([author: [:name]], strict?: true)
+      |> Ash.create!()
+      |> assert_strict_author()
+    end
+
+    test "loads all fields on related resource without strict?", %{author: author} do
+      post =
+        Ash.create!(Post, %{title: "new", author_id: author.id}, load: [author: [:name]])
+
+      assert post.author.name == "a"
+      refute match?(%Ash.NotLoaded{}, post.author.bio)
+    end
+
+    test "update only loads specified fields on related resource", %{post: post} do
+      post
+      |> Ash.update!(%{title: "updated"}, load: [author: [:name]], strict?: true)
+      |> assert_strict_author()
+    end
+
+    test "destroy only loads specified fields on related resource", %{post: post} do
+      post
+      |> Ash.destroy!(return_destroyed?: true, load: [author: [:name]], strict?: true)
+      |> assert_strict_author()
+    end
+
+    test "bulk_create only loads specified fields on related resource", %{author: author} do
+      assert %Ash.BulkResult{records: [post]} =
+               Ash.bulk_create!([%{title: "new", author_id: author.id}], Post, :create,
+                 return_records?: true,
+                 load: [author: [:name]],
+                 strict?: true
+               )
+
+      assert_strict_author(post)
+    end
+
+    for strategy <- [:atomic, :stream] do
+      test "bulk_update with the #{strategy} strategy only loads specified fields on related resource",
+           %{post: post} do
+        assert %Ash.BulkResult{records: [post]} =
+                 Post
+                 |> Ash.Query.filter(id == ^post.id)
+                 |> Ash.bulk_update!(:update, %{title: "updated"},
+                   strategy: unquote(strategy),
+                   return_records?: true,
+                   load: [author: [:name]],
+                   strict?: true
+                 )
+
+        assert_strict_author(post)
+      end
+
+      test "bulk_destroy with the #{strategy} strategy only loads specified fields on related resource",
+           %{post: post} do
+        assert %Ash.BulkResult{records: [post]} =
+                 Post
+                 |> Ash.Query.filter(id == ^post.id)
+                 |> Ash.bulk_destroy!(:destroy, %{},
+                   strategy: unquote(strategy),
+                   return_records?: true,
+                   load: [author: [:name]],
+                   strict?: true
+                 )
+
+        assert_strict_author(post)
+      end
+    end
+  end
+
   test "read action loads are ignored with `Ash.load`" do
     author =
       Author
@@ -2414,6 +2763,39 @@ defmodule Ash.Test.Actions.LoadTest do
       # The top 3 categories should be A, B, C (priorities 100, 90, 80)
       top_category_names = post_with_top.top_categories |> Enum.map(& &1.name) |> Enum.sort()
       assert top_category_names == ["A", "B", "C"]
+    end
+
+    test "a smaller limit on the related query applies to a relationship with a limit" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "Test Post"})
+        |> Ash.create!()
+
+      for priority <- [100, 90, 80, 70] do
+        category =
+          Category
+          |> Ash.Changeset.for_create(:create, %{name: "#{priority}"})
+          |> Ash.create!()
+
+        PostCategory
+        |> Ash.Changeset.for_create(:create, %{
+          post_id: post.id,
+          category_id: category.id,
+          priority: priority
+        })
+        |> Ash.create!()
+      end
+
+      priorities = fn limit ->
+        post
+        |> Ash.load!(top_post_categories: Ash.Query.limit(PostCategory, limit))
+        |> Map.get(:top_post_categories)
+        |> Enum.map(& &1.priority)
+      end
+
+      assert priorities.(2) == [100, 90]
+      assert priorities.(0) == []
+      assert priorities.(10) == [100, 90, 80]
     end
   end
 

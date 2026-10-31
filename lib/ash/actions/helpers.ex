@@ -81,6 +81,8 @@ defmodule Ash.Actions.Helpers do
                     changeset
                   )
 
+                {:ok, change_opts} = Ash.Resource.Change.init(mod, change_opts)
+
                 if Ash.Resource.Change.batch_callbacks?(mod, [changeset], change_opts, context) do
                   [%{change | change: {mod, change_opts}}]
                 else
@@ -277,6 +279,13 @@ defmodule Ash.Actions.Helpers do
       end
 
     opts =
+      if as_of = Map.get(query_or_changeset, :as_of) do
+        Keyword.put_new(opts, :as_of, as_of)
+      else
+        opts
+      end
+
+    opts =
       case query_or_changeset.context do
         %{
           private: %{
@@ -313,6 +322,75 @@ defmodule Ash.Actions.Helpers do
   end
 
   @doc false
+  # Stamp the instant a write was made at onto the record it returns, so a later
+  # `Ash.load/3` or `Ash.reload/2` of that record reuses it (parity with how tenant is
+  # stamped — see `Ash.load/3`). It replaces any instant the record was read or written at
+  # before, since the record now reflects this write. Later writes don't reuse it: a write
+  # given no `as_of` is made now. A range stamps the instant it begins at.
+  def put_write_as_of(metadata, resource, %Ash.Range{} = as_of),
+    do: put_write_as_of(metadata, resource, Ash.Temporal.resolve_write_as_of(as_of))
+
+  def put_write_as_of(metadata, resource, %DateTime{} = as_of) do
+    if Ash.Resource.Info.temporal?(resource) do
+      Map.put(metadata, :as_of, as_of)
+    else
+      metadata
+    end
+  end
+
+  def put_write_as_of(metadata, _resource, _as_of), do: metadata
+
+  @doc false
+  # A bulk write given no `as_of` takes one `now`, pinned here, for every record it writes.
+  def pin_temporal_now(opts, resource) do
+    context = opts[:context] || %{}
+
+    if is_nil(opts[:as_of]) and Ash.Resource.Info.temporal?(resource) and
+         is_nil(context[:private][:temporal_now]) do
+      Keyword.put(
+        opts,
+        :context,
+        Ash.Helpers.deep_merge_maps(context, %{private: %{temporal_now: DateTime.utc_now()}})
+      )
+    else
+      opts
+    end
+  end
+
+  @doc false
+  def unscope_write_read_as_of(%Ash.Query{} = query, %Ash.Range{}) do
+    context =
+      query.context
+      |> Map.delete(:as_of)
+      |> Map.update(:shared, %{}, &Map.delete(&1, :as_of))
+
+    %{query | as_of: nil, context: context}
+  end
+
+  def unscope_write_read_as_of(query, _as_of), do: query
+
+  @doc false
+  # Stamp `tenant`/`as_of` onto each record's metadata, but only walk the list when there is
+  # actually something to stamp — so a plain (non-tenant, non-temporal) result isn't
+  # remapped for nothing.
+  def stamp_record_metadata(records, resource, opts) do
+    tenant = opts[:tenant]
+    as_of = Ash.Temporal.resolve_write_as_of(opts[:as_of])
+    stamp_as_of? = match?(%DateTime{}, as_of) and Ash.Resource.Info.temporal?(resource)
+
+    if is_nil(tenant) and not stamp_as_of? do
+      records
+    else
+      Enum.map(records, fn record ->
+        metadata =
+          if tenant, do: Map.put(record.__metadata__, :tenant, tenant), else: record.__metadata__
+
+        %{record | __metadata__: put_write_as_of(metadata, resource, as_of)}
+      end)
+    end
+  end
+
+  @doc false
   def set_when_ok(opts, key, value, merger \\ fn _l, r -> r end)
 
   def set_when_ok(opts, key, {:ok, value}, merger) do
@@ -336,11 +414,13 @@ defmodule Ash.Actions.Helpers do
         query_or_changeset
         |> Ash.ActionInput.set_context(%{private: private_context})
         |> Ash.ActionInput.set_tenant(query_or_changeset.tenant || opts[:tenant])
+        |> set_subject_as_of(query_or_changeset.as_of || opts[:as_of])
 
       %Ash.Query{} ->
         query_or_changeset
         |> Ash.Query.set_context(%{private: private_context})
         |> Ash.Query.set_tenant(query_or_changeset.tenant || opts[:tenant])
+        |> set_subject_as_of(query_or_changeset.as_of || opts[:as_of])
 
       %Ash.Changeset{} ->
         query_or_changeset
@@ -348,8 +428,39 @@ defmodule Ash.Actions.Helpers do
           private: private_context
         })
         |> Ash.Changeset.set_tenant(query_or_changeset.tenant || opts[:tenant])
+        |> set_subject_as_of(query_or_changeset.as_of || opts[:as_of])
     end
   end
+
+  # `as_of` is threaded like `tenant`. For reads this is the single point it's set on the
+  # query, so we resolve `:now` (and the temporal default — a temporal resource with no
+  # `as_of` reads as current-state) to a concrete `DateTime` here; it's then never
+  # re-evaluated downstream, so every consumer (the `@> as_of` filter, `now()`/`ago()`
+  # anchoring, related loads, aggregates, subqueries) threads the exact same instant.
+  # Writes are left as-is — the data layer resolves the write's `as_of` once at execution.
+  defp set_subject_as_of(%Ash.Query{} = query, as_of) do
+    case resolve_query_as_of(query, as_of) do
+      nil -> query
+      resolved -> Ash.Query.as_of(query, resolved)
+    end
+  end
+
+  defp set_subject_as_of(subject, nil), do: subject
+
+  defp set_subject_as_of(%Ash.Changeset{} = changeset, as_of),
+    do: Ash.Changeset.as_of(changeset, as_of)
+
+  defp set_subject_as_of(%Ash.ActionInput{} = input, as_of),
+    do: Ash.ActionInput.set_as_of(input, as_of)
+
+  defp resolve_query_as_of(_query, :now), do: DateTime.utc_now()
+
+  defp resolve_query_as_of(query, nil) do
+    if Ash.Resource.Info.temporal?(query.resource), do: DateTime.utc_now()
+  end
+
+  # Anything else is passed through, so the read refuses what names no instant by name.
+  defp resolve_query_as_of(_query, as_of), do: as_of
 
   defp add_actor(opts, query_or_changeset, domain) do
     if !domain do
@@ -431,34 +542,70 @@ defmodule Ash.Actions.Helpers do
   end
 
   @doc false
+  def queue_notifications(notifications) do
+    case List.wrap(notifications) do
+      [] ->
+        :ok
+
+      notifications ->
+        case Process.get(:ash_notifications) do
+          nil -> Process.put(:ash_notifications, notifications)
+          current -> Process.put(:ash_notifications, [current, notifications])
+        end
+
+        :ok
+    end
+  end
+
+  @doc false
+  # Anything queued during a transaction that was rolled back never happened,
+  # so the queue is reset to what it was before that transaction started.
+  def restore_queued_notifications(nil), do: Process.delete(:ash_notifications)
+  def restore_queued_notifications(queued), do: Process.put(:ash_notifications, queued)
+
+  @doc false
+  def peek_queued_notifications do
+    :ash_notifications |> Process.get([]) |> List.flatten()
+  end
+
+  @doc false
+  def take_queued_notifications do
+    case Process.delete(:ash_notifications) do
+      nil -> []
+      notifications -> List.flatten(notifications)
+    end
+  end
+
+  @doc false
   def notify({:ok, record, instructions}, changeset, opts) do
     resource_notification = resource_notification(changeset, record, opts)
 
-    if opts[:return_notifications?] do
-      {:ok, record,
-       Map.update(
-         instructions,
-         :notifications,
-         [resource_notification],
-         &[resource_notification | &1]
-       )}
-    else
-      if Process.get(:ash_started_transaction?) do
-        current_notifications = Process.get(:ash_notifications, [])
+    cond do
+      opts[:return_notifications?] ->
+        {:ok, record,
+         Map.update(
+           instructions,
+           :notifications,
+           [resource_notification],
+           &[resource_notification | &1]
+         )}
 
-        Process.put(
-          :ash_notifications,
-          [resource_notification | current_notifications]
-        )
-      else
+      resource_notification.for == [] ->
+        {:ok, record, instructions}
+
+      Process.get(:ash_started_transaction?) ->
+        queue_notifications([resource_notification])
+
+        {:ok, record, instructions}
+
+      true ->
         unsent_notifications = Ash.Notifier.notify([resource_notification])
 
         warn_missed!(changeset.resource, changeset.action, %{
           resource_notifications: unsent_notifications
         })
-      end
 
-      {:ok, record, instructions}
+        {:ok, record, instructions}
     end
   end
 
@@ -726,7 +873,7 @@ defmodule Ash.Actions.Helpers do
 
   def apply_opts_load(%Ash.Changeset{} = changeset, opts) do
     if opts[:load] do
-      Ash.Changeset.load(changeset, opts[:load])
+      Ash.Changeset.load(changeset, opts[:load], Keyword.take(opts, [:strict?]))
     else
       changeset
     end
@@ -747,6 +894,39 @@ defmodule Ash.Actions.Helpers do
       input
     end
   end
+
+  @doc false
+  # A write over a range spans every version it overlaps, so calculations, aggregates and
+  # relationships have no single instant to be answered at, and none can be loaded.
+  def refuse_load_over_range(%Ash.Changeset{as_of: %Ash.Range{} = as_of, load: load} = changeset)
+      when load not in [nil, []] do
+    Ash.Changeset.add_error(
+      changeset,
+      Ash.Error.Framework.LoadOverRange.exception(
+        resource: changeset.resource,
+        as_of: as_of,
+        load: load
+      )
+    )
+  end
+
+  def refuse_load_over_range(changeset), do: changeset
+
+  @doc false
+  # Only an atomic write updates each version a range overlaps from its own values, so a bulk
+  # write over a range that has fallen back to streaming is refused.
+  def refuse_stream_over_range(resource, action, %Ash.Range{} = as_of) do
+    {:error,
+     Ash.Error.to_error_class(
+       Ash.Error.Framework.NotAtomicOverRange.exception(
+         resource: resource,
+         action: action.name,
+         as_of: as_of
+       )
+     )}
+  end
+
+  def refuse_stream_over_range(_resource, _action, _as_of), do: :ok
 
   def load({:ok, result, instructions}, changeset, domain, opts) do
     notifier_query = notifier_query_for(changeset)
@@ -1047,6 +1227,22 @@ defmodule Ash.Actions.Helpers do
 
   def get_multitenancy_from_context(_), do: nil
 
+  @doc false
+  # An upsert's keys don't always include the multitenancy attribute (the primary key, or an
+  # `all_tenants?` identity), so the record it conflicts with may be in another tenant. This is
+  # the filter that record must match to be updated or returned, or `nil` if it needn't.
+  @spec upsert_tenant_filter(Ash.Changeset.t()) :: Keyword.t() | nil
+  def upsert_tenant_filter(changeset) do
+    if changeset.tenant &&
+         Ash.Resource.Info.multitenancy_strategy(changeset.resource) == :attribute &&
+         get_multitenancy_from_context(changeset) not in [:bypass, :bypass_all] do
+      attribute = Ash.Resource.Info.multitenancy_attribute(changeset.resource)
+      {m, f, a} = Ash.Resource.Info.multitenancy_parse_attribute(changeset.resource)
+
+      [{attribute, apply(m, f, [changeset.to_tenant | a])}]
+    end
+  end
+
   @doc """
   Validates that a changeset has a tenant when required by the resource.
 
@@ -1063,4 +1259,14 @@ defmodule Ash.Actions.Helpers do
       :ok
     end
   end
+
+  @doc false
+  @spec authorizers?(Ash.Resource.t() | Ash.Query.t() | Ash.Changeset.t() | [Ash.Changeset.t()]) ::
+          boolean()
+  def authorizers?(resource) when is_atom(resource),
+    do: Ash.Resource.Info.authorizers(resource) != []
+
+  def authorizers?(%{resource: resource}), do: authorizers?(resource)
+  def authorizers?([%{resource: resource} | _]), do: authorizers?(resource)
+  def authorizers?(_), do: true
 end

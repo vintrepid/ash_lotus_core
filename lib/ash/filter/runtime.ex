@@ -21,27 +21,80 @@ defmodule Ash.Filter.Runtime do
 
   def filter_matches(_domain, records, nil, _opts), do: {:ok, records}
 
-  def filter_matches(domain, records, filter, opts) do
-    {records, parent} = load_records_and_parent(records, domain, opts[:parent], filter, opts)
+  def filter_matches(domain, original_records, filter, opts) do
+    {records, parent} =
+      load_records_and_parent(original_records, domain, opts[:parent], filter, opts)
 
-    Enum.reduce_while(records, {:ok, []}, fn record, {:ok, records} ->
-      case matches(record, filter, Keyword.put(opts, :parent, parent)) do
-        {:ok, falsey} when falsey in [false, nil] ->
-          {:cont, {:ok, records}}
+    # Every record shares a resource, so hydrate the filter and compute its
+    # relationship paths once rather than once per record.
+    hydrated =
+      case records do
+        [%resource{} | _] ->
+          Ash.Filter.hydrate_refs(filter, %{
+            resource: resource,
+            public?: false,
+            parent_stack: parent_stack(parent),
+            conflicting_upsert_values: opts[:conflicting_upsert_values]
+          })
 
-        {:ok, _} ->
-          {:cont, {:ok, [record | records]}}
-
-        {:error, error} ->
-          {:halt, {:error, error}}
+        _ ->
+          {:ok, filter}
       end
-    end)
-    |> case do
-      {:ok, records} ->
-        {:ok, Enum.reverse(records)}
 
-      other ->
-        other
+    with {:ok, filter} <- hydrated do
+      relationship_paths = Ash.Filter.relationship_paths(filter)
+      opts = Keyword.put(opts, :parent, parent)
+
+      # Relationships are loaded without authorization to evaluate the filter, so the
+      # records that match are returned as they were given.
+      records
+      |> Enum.zip(original_records)
+      |> Enum.reduce_while({:ok, []}, fn {record, original_record}, {:ok, records} ->
+        case matches(record, filter, relationship_paths, opts) do
+          {:ok, falsey} when falsey in [false, nil] ->
+            {:cont, {:ok, records}}
+
+          {:ok, _} ->
+            {:cont, {:ok, [original_record | records]}}
+
+          {:error, error} ->
+            {:halt, {:error, error}}
+        end
+      end)
+      |> case do
+        {:ok, records} ->
+          {:ok, Enum.reverse(records)}
+
+        other ->
+          other
+      end
+    end
+  end
+
+  @doc """
+  Keeps the records of a temporal resource whose period holds `as_of`.
+
+  For data layers that answer a read by materialising records and filtering them in
+  the BEAM. Records are returned untouched when the resource is not temporal or there
+  is no instant to narrow to, and a record carrying no period is dropped.
+  """
+  @spec as_of_matches([Ash.Resource.Record.t()], Ash.Resource.t(), term()) ::
+          [Ash.Resource.Record.t()]
+  def as_of_matches(records, resource, as_of)
+  def as_of_matches(records, _resource, nil), do: records
+
+  def as_of_matches(records, resource, as_of) do
+    case Ash.Resource.Info.temporal_attribute(resource) do
+      nil ->
+        records
+
+      period_attribute ->
+        Enum.filter(records, fn record ->
+          case Map.get(record, period_attribute) do
+            %Ash.Range{} = period -> Ash.Range.contains?(period, as_of)
+            _ -> false
+          end
+        end)
     end
   end
 
@@ -114,21 +167,16 @@ defmodule Ash.Filter.Runtime do
     {records, parent}
   end
 
-  defp matches(record, expression, opts) do
-    relationship_paths =
-      expression
-      |> Ash.Filter.relationship_paths()
-
+  defp matches(record, expression, relationship_paths, opts) do
     record
     |> stream_relationships(relationship_paths)
     |> Enum.reduce_while({:ok, false}, fn scenario, {:ok, false} ->
-      case do_match(
+      case do_match_hydrated(
              scenario,
              expression,
              opts[:parent],
              nil,
-             opts[:unknown_on_unknown_refs?],
-             opts[:conflicting_upsert_values]
+             opts[:unknown_on_unknown_refs?]
            ) do
         {:error, error} ->
           {:halt, {:error, error}}
@@ -305,20 +353,24 @@ defmodule Ash.Filter.Runtime do
       end
 
     with {:ok, hydrated} <- hydrated do
-      case resolve_expr(hydrated, record, parent, resource, unknown_on_unknown_refs?) do
-        :unknown ->
-          if unknown_on_unknown_refs? do
-            :unknown
-          else
-            {:ok, nil}
-          end
+      do_match_hydrated(record, hydrated, parent, resource, unknown_on_unknown_refs?)
+    end
+  end
 
-        {:ok, value} ->
-          {:ok, value}
+  defp do_match_hydrated(record, hydrated, parent, resource, unknown_on_unknown_refs?) do
+    case resolve_expr(hydrated, record, parent, resource, unknown_on_unknown_refs?) do
+      :unknown ->
+        if unknown_on_unknown_refs? do
+          :unknown
+        else
+          {:ok, nil}
+        end
 
-        other ->
-          other
-      end
+      {:ok, value} ->
+        {:ok, value}
+
+      other ->
+        other
     end
   end
 
@@ -842,11 +894,13 @@ defmodule Ash.Filter.Runtime do
   defp try_cast_arguments(configured_args, args) do
     given_arg_count = Enum.count(args)
 
-    configured_args
-    |> Enum.filter(fn args ->
-      Enum.count(args) == given_arg_count
-    end)
-    |> Enum.find_value(&Ash.Query.Function.try_cast_arguments(&1, args))
+    signatures =
+      Enum.filter(configured_args, fn args ->
+        Enum.count(args) == given_arg_count
+      end)
+
+    Enum.find_value(signatures, &Ash.Query.Function.try_cast_arguments(&1, args, exact?: true)) ||
+      Enum.find_value(signatures, &Ash.Query.Function.try_cast_arguments(&1, args))
   end
 
   defp resolve_ref(
@@ -854,13 +908,14 @@ defmodule Ash.Filter.Runtime do
            relationship_path: relationship_path,
            resource: resource,
            combinations?: combinations?,
-           attribute: %Ash.Query.Calculation{
-             module: module,
-             opts: opts,
-             name: name,
-             load: load,
-             context: context
-           }
+           attribute:
+             %Ash.Query.Calculation{
+               module: module,
+               opts: opts,
+               name: name,
+               load: load,
+               context: context
+             } = calculation
          },
          record,
          parent,
@@ -934,6 +989,14 @@ defmodule Ash.Filter.Runtime do
             })
 
           with {:ok, hydrated} <- hydrated do
+            {_calculation, hydrated} =
+              Ash.Actions.Read.RelatedAuthorization.authorize_calculation(
+                calculation,
+                hydrated,
+                resource,
+                parent_stack: parent_stack(parent)
+              )
+
             hydrated
             |> Ash.Filter.prefix_refs(relationship_path)
             |> resolve_expr(record, parent, resource, unknown_on_unknown_refs?)

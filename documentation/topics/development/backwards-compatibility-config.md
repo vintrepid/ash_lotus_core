@@ -318,3 +318,96 @@ the destination record (using the given action) and the join record (using the
 primary destroy action on the join resource). This makes the 2-tuple behavior
 consistent with the `:destroy` shorthand and the explicit 3-tuple
 `{:destroy, :dest_action, :join_action}`.
+
+## infer_generic_action_reactors?
+
+```elixir
+config :ash, infer_generic_action_reactors?: false
+```
+
+### Old Behavior
+
+A generic action's `run` option accepted a `Reactor` module directly, i.e
+`run MyReactor`. To support this, Ash had to check whether every `run` module
+was a Reactor, which made each resource depend at compile time on all of the
+modules used in its generic actions. Changing any of those modules recompiled
+the resource, and everything that depends on it at compile time.
+
+### New Behavior
+
+`run` modules are always treated as `Ash.Resource.Actions.Implementation`s, and
+resources no longer take a compile-time dependency on them. Ash no longer checks
+whether a `run` module is a Reactor, so passing one directly fails at runtime,
+since it doesn't implement `run/3`. Reactors must be wrapped with `reactor/2`
+(see `Ash.Resource.Actions.Implementation.Builtins.reactor/2`):
+
+```elixir
+run reactor(MyReactor)
+```
+
+Options given to `reactor/2` are passed to `Reactor.run/4`. Because the resource doesn't
+depend on the Reactor at compile time, Ash also doesn't verify at compile time
+that the action has an argument for each of the Reactor's inputs.
+`reactor/2` works with either setting, so you can migrate
+before enabling it.
+
+## keyset_signing_secret
+
+```elixir
+# config/dev.exs and config/test.exs
+config :ash, keyset_signing_secret: "a-long-random-string"
+
+# config/runtime.exs
+if config_env() == :prod do
+  config :ash,
+    keyset_signing_secret:
+      System.get_env("ASH_KEYSET_SIGNING_SECRET") ||
+        raise("environment variable ASH_KEYSET_SIGNING_SECRET is missing")
+end
+```
+
+Unlike the other settings, the installer generates a separate random secret for
+each environment rather than a fixed value. Use a different secret in each
+environment, and keep the production secret out of source control.
+
+If your application uses Phoenix, the installer instead derives the production
+secret from Phoenix's `SECRET_KEY_BASE`, so there is only one secret to manage.
+Deriving a separate key means Ash never signs with the same key that Phoenix is
+given:
+
+```elixir
+# config/runtime.exs
+if config_env() == :prod do
+  config :ash,
+    keyset_signing_secret:
+      :crypto.mac(
+        :hmac,
+        :sha256,
+        System.get_env("SECRET_KEY_BASE") ||
+          raise("environment variable SECRET_KEY_BASE is missing"),
+        "ash keyset signing"
+      )
+end
+```
+
+### Old Behavior
+
+Keysets returned by Ash were plain encoded values. Ash accepted any keyset passed
+to `after`/`before` that decoded to the right shape, including ones constructed
+by a client.
+
+### New Behavior
+
+Ash signs each keyset it returns with an HMAC, and only accepts keysets with a valid
+signature. Keysets that were not signed, were signed with a different secret, or were
+modified are rejected with an `Ash.Error.Page.InvalidKeyset` error, before they are
+decoded. Because a signed keyset can only have come from your application, signed
+keysets are not limited by `max_keyset_byte_size`.
+
+The secret must be a non-empty string. If it is set to anything else, such as an
+empty string or a number, Ash raises an `ArgumentError` naming the setting rather
+than silently rejecting every keyset.
+
+Keysets returned before enabling this, or before rotating the secret, are no longer
+accepted, so clients paginating at that moment will need to start again from the
+first page.

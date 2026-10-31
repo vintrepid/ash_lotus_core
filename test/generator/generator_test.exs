@@ -785,12 +785,8 @@ defmodule Ash.Test.GeneratorTest do
   end
 
   test "string generator honors trim?: true" do
-    check(
-      all(
-        string <- Ash.Type.String.generator(length_count: :graphemes, min_length: 5, trim?: true)
-      )
-    ) do
-      assert String.length(String.trim(string)) >= 5
+    check all(string <- Ash.Type.String.generator(min_length: 5, trim?: true)) do
+      assert {:ok, _} = Ash.Type.String.apply_constraints(string, min_length: 5, trim?: true)
     end
   end
 

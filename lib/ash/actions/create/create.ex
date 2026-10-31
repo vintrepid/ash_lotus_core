@@ -179,6 +179,21 @@ defmodule Ash.Actions.Create do
         }
       })
 
+    # The condition the changeset was built with is already in its filter, so a different one
+    # passed when running it is added to it, as `bulk_create` does
+    changeset =
+      case opts[:upsert_condition] do
+        nil ->
+          changeset
+
+        upsert_condition ->
+          if upsert_condition == get_in(changeset.context, [:private, :upsert_condition]) do
+            changeset
+          else
+            Ash.Changeset.filter(changeset, upsert_condition)
+          end
+      end
+
     with %{valid?: true} = changeset <- handle_multitenancy(changeset, action),
          %{valid?: true} = changeset <- changeset(changeset, domain, action, opts),
          %{valid?: true} = changeset <- check_upsert_support(changeset, opts),
@@ -217,7 +232,7 @@ defmodule Ash.Actions.Create do
   end
 
   defp authorize(changeset, opts) do
-    if opts[:authorize?] do
+    if opts[:authorize?] && Ash.Actions.Helpers.authorizers?(changeset) do
       case Ash.can(changeset, opts[:actor],
              alter_source?: true,
              pre_flight?: true,
@@ -241,11 +256,19 @@ defmodule Ash.Actions.Create do
   defp add_tenant({:ok, nil}, _), do: {:ok, nil}
 
   defp add_tenant({:ok, data}, changeset) do
-    if changeset.tenant do
-      {:ok, %{data | __metadata__: Map.put(data.__metadata__, :tenant, changeset.tenant)}}
-    else
-      {:ok, data}
-    end
+    metadata =
+      data.__metadata__
+      |> then(fn metadata ->
+        if changeset.tenant, do: Map.put(metadata, :tenant, changeset.tenant), else: metadata
+      end)
+      |> Ash.Actions.Helpers.put_write_as_of(changeset.resource, changeset.as_of)
+
+    {:ok, %{data | __metadata__: metadata}}
+  end
+
+  defp add_tenant({:ok, data, instructions}, changeset) do
+    {:ok, data} = add_tenant({:ok, data}, changeset)
+    {:ok, data, instructions}
   end
 
   defp add_tenant(other, _), do: other
@@ -309,6 +332,13 @@ defmodule Ash.Actions.Create do
       end
 
     changeset = set_tenant(changeset)
+
+    changeset =
+      if opts[:upsert?] do
+        Ash.Changeset.filter(changeset, Helpers.upsert_tenant_filter(changeset))
+      else
+        changeset
+      end
 
     is_upsert? = changeset.context[:private][:upsert?]
 

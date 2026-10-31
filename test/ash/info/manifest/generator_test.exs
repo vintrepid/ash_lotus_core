@@ -130,6 +130,115 @@ defmodule Ash.Test.Info.Manifest.GeneratorTest do
     end
   end
 
+  describe "aggregate field types" do
+    setup do
+      {:ok, spec} =
+        Ash.Info.Manifest.generate(
+          otp_app: :ash_manifest_test,
+          action_entrypoints: [{Ash.Test.Manifest.AggregateHolder, :read}]
+        )
+
+      holder = Enum.find(spec.resources, &(&1.module == Ash.Test.Manifest.AggregateHolder))
+
+      %{spec: spec, holder: holder}
+    end
+
+    test "an embedded resource reached only through a first aggregate is in spec.types",
+         %{spec: spec, holder: holder} do
+      field_type = holder.fields[:first_meta].type
+      assert field_type.kind == :embedded_resource
+      assert field_type.module == Ash.Test.Manifest.AggregateFirstMeta
+
+      embedded = Enum.find(spec.types, &(&1.module == Ash.Test.Manifest.AggregateFirstMeta))
+      assert embedded != nil
+      assert embedded.kind == :embedded_resource
+    end
+
+    test "an embedded resource reached only through a list aggregate is in spec.types",
+         %{spec: spec, holder: holder} do
+      field_type = holder.fields[:list_metas].type
+      assert field_type.kind == :array
+      assert field_type.item_type.kind == :embedded_resource
+      assert field_type.item_type.module == Ash.Test.Manifest.AggregateListMeta
+
+      embedded = Enum.find(spec.types, &(&1.module == Ash.Test.Manifest.AggregateListMeta))
+      assert embedded != nil
+      assert embedded.kind == :embedded_resource
+    end
+
+    test "a first aggregate with related?: false names its embedded type and reaches it",
+         %{spec: spec, holder: holder} do
+      assert_embedded_field(
+        spec,
+        holder,
+        :unrelated_first_meta,
+        Ash.Test.Manifest.AggregateUnrelatedFirstMeta
+      )
+    end
+
+    test "a list aggregate with related?: false names its embedded type and reaches it",
+         %{spec: spec, holder: holder} do
+      assert_embedded_array_field(
+        spec,
+        holder,
+        :unrelated_list_metas,
+        Ash.Test.Manifest.AggregateUnrelatedListMeta
+      )
+    end
+
+    test "a first aggregate over an aggregate names its embedded type and reaches it",
+         %{spec: spec, holder: holder} do
+      assert_embedded_field(
+        spec,
+        holder,
+        :nested_first_meta,
+        Ash.Test.Manifest.AggregateNestedFirstMeta
+      )
+    end
+
+    test "a list aggregate over an aggregate names its embedded type and reaches it",
+         %{spec: spec, holder: holder} do
+      assert_embedded_array_field(
+        spec,
+        holder,
+        :nested_list_metas,
+        Ash.Test.Manifest.AggregateNestedListMeta
+      )
+    end
+
+    test "an unrelated aggregate reads its field from the target resource, not the holder",
+         %{spec: spec, holder: holder} do
+      # AggregateHolder has its own private `:shadowed_meta` attribute of type :string.
+      assert_embedded_field(
+        spec,
+        holder,
+        :unrelated_shadowed_meta,
+        Ash.Test.Manifest.AggregateShadowedMeta
+      )
+    end
+  end
+
+  defp assert_embedded_field(spec, holder, field_name, embedded_module) do
+    field_type = holder.fields[field_name].type
+    assert field_type.kind == :embedded_resource
+    assert field_type.module == embedded_module
+    assert_embedded_type_defined(spec, embedded_module)
+  end
+
+  defp assert_embedded_array_field(spec, holder, field_name, embedded_module) do
+    field_type = holder.fields[field_name].type
+    assert field_type.kind == :array
+    assert field_type.item_type.kind == :embedded_resource
+    assert field_type.item_type.module == embedded_module
+    assert_embedded_type_defined(spec, embedded_module)
+  end
+
+  defp assert_embedded_type_defined(spec, embedded_module) do
+    embedded = Enum.find(spec.types, &(&1.module == embedded_module))
+    assert embedded != nil, "#{inspect(embedded_module)} is missing from spec.types"
+    assert embedded.kind == :embedded_resource
+  end
+
   describe "private actions" do
     test "are excluded from entrypoints by default" do
       {:ok, spec} = Ash.Info.Manifest.generate(otp_app: :ash_manifest_test)
@@ -325,5 +434,35 @@ defmodule Ash.Test.Info.Manifest.GeneratorTest do
         end
       end
     end
+  end
+
+  defmodule EqualityFilteredTicket do
+    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
+
+    ets do
+      private? true
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :reference_code, :string, public?: true, filterable?: :simple_equality
+    end
+
+    actions do
+      defaults [:read]
+    end
+  end
+
+  test "describe a ticket reference code that clients can filter by equality" do
+    assert {:ok, manifest} =
+             Ash.Info.Manifest.generate(
+               otp_app: :ash_manifest_test,
+               action_entrypoints: [{EqualityFilteredTicket, :read}]
+             )
+
+    ticket = Enum.find(manifest.resources, &(&1.module == EqualityFilteredTicket))
+    reference_code = ticket.fields.reference_code
+    assert reference_code.filterable?
+    assert Enum.map(reference_code.filter_operators, & &1.name) == [:==]
   end
 end

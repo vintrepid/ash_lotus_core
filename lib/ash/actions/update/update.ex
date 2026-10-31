@@ -161,8 +161,22 @@ defmodule Ash.Actions.Update do
             |> Ash.Changeset.set_context(%{data_layer: %{use_atomic_update_data?: true}})
             |> Map.put(:load, changeset.load)
             |> Map.put(:select, changeset.select)
-            |> Map.put(:filter, changeset.added_filter)
             |> Ash.Changeset.set_context(changeset.context)
+
+          # the atomic changeset carries filters added by the action's changes,
+          # so the caller's filters are added to it rather than replacing it
+          atomic_changeset =
+            if changeset.added_filter do
+              case Ash.Filter.add_to_filter(atomic_changeset.filter, changeset.added_filter) do
+                {:ok, filter} ->
+                  %{atomic_changeset | filter: filter}
+
+                {:error, error} ->
+                  Ash.Changeset.add_error(atomic_changeset, error)
+              end
+            else
+              atomic_changeset
+            end
 
           {atomic_changeset, opts} =
             Ash.Actions.Helpers.set_context_and_get_opts(domain, atomic_changeset, opts)
@@ -192,6 +206,7 @@ defmodule Ash.Actions.Update do
               tracer: opts[:tracer]
             )
             |> Ash.Query.do_filter(primary_key_filter)
+            |> Ash.Actions.Helpers.unscope_write_read_as_of(atomic_changeset.as_of)
 
           authorize_changeset_with =
             if Ash.DataLayer.data_layer_can?(atomic_changeset.resource, :expr_error) do
@@ -213,7 +228,9 @@ defmodule Ash.Actions.Update do
                    authorize_query?: false,
                    return_records?: true,
                    atomic_changeset: atomic_changeset,
-                   authorize_changeset_with: authorize_changeset_with
+                   authorize_changeset_with: authorize_changeset_with,
+                   transaction:
+                     Keyword.get(opts, :transaction?, true) && action.transaction? && :batch
                  )
                ) do
             %Ash.BulkResult{status: :success, records: [record], notifications: notifications} ->
@@ -256,7 +273,10 @@ defmodule Ash.Actions.Update do
             {changeset, opts} =
               Ash.Actions.Helpers.set_context_and_get_opts(domain, changeset, opts)
 
-            changeset = Helpers.apply_opts_load(changeset, opts)
+            changeset =
+              changeset
+              |> Helpers.apply_opts_load(opts)
+              |> Helpers.refuse_load_over_range()
 
             Ash.Tracer.span :action,
                             fn ->
@@ -373,7 +393,7 @@ defmodule Ash.Actions.Update do
   end
 
   defp authorize(changeset, opts) do
-    if opts[:authorize?] do
+    if opts[:authorize?] && Ash.Actions.Helpers.authorizers?(changeset) do
       case Ash.can(changeset, opts[:actor],
              alter_source?: true,
              return_forbidden_error?: true,
@@ -395,11 +415,19 @@ defmodule Ash.Actions.Update do
   end
 
   defp add_tenant({:ok, data}, changeset) do
-    if changeset.tenant do
-      {:ok, %{data | __metadata__: Map.put(data.__metadata__, :tenant, changeset.tenant)}}
-    else
-      {:ok, data}
-    end
+    metadata =
+      data.__metadata__
+      |> then(fn metadata ->
+        if changeset.tenant, do: Map.put(metadata, :tenant, changeset.tenant), else: metadata
+      end)
+      |> Ash.Actions.Helpers.put_write_as_of(changeset.resource, changeset.as_of)
+
+    {:ok, %{data | __metadata__: metadata}}
+  end
+
+  defp add_tenant({:ok, data, instructions}, changeset) do
+    {:ok, data} = add_tenant({:ok, data}, changeset)
+    {:ok, data, instructions}
   end
 
   defp add_tenant(other, _changeset) do
@@ -513,7 +541,7 @@ defmodule Ash.Actions.Update do
                     {mod, action_opts} = changeset.action.manual
 
                     if result = changeset.context[:private][:action_result] do
-                      result
+                      add_tenant(result, changeset)
                     else
                       changeset
                       |> Ash.Changeset.set_defaults(:update, true)
@@ -536,6 +564,7 @@ defmodule Ash.Actions.Update do
                           changeset.action
                         )
                       end)
+                      |> add_tenant(changeset)
                       |> manage_relationships(domain, changeset,
                         actor: opts[:actor],
                         authorize?: opts[:authorize?]
@@ -597,8 +626,10 @@ defmodule Ash.Actions.Update do
                               Ash.Filter.get_filter(changeset.resource, changeset.data)
 
                             changeset.resource
+                            |> Ash.Query.set_tenant(changeset.tenant)
                             |> Ash.Query.do_filter(changeset.filter)
                             |> Ash.Query.do_filter(record_filter)
+                            |> Ash.Query.as_of(Ash.Temporal.resolve_write_as_of(changeset.as_of))
                             |> Ash.Query.select(changeset.action_select)
                             |> Ash.Query.data_layer_query()
                             |> case do

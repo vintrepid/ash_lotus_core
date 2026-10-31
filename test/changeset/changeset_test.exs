@@ -709,6 +709,27 @@ defmodule Ash.Test.Changeset.ChangesetTest do
     end
   end
 
+  describe "after_action hooks" do
+    test "every hook sees the after_action phase, not only the first" do
+      test_pid = self()
+
+      Category
+      |> Ash.Changeset.for_create(:create, %{name: "foo"})
+      |> Ash.Changeset.after_action(fn changeset, record ->
+        send(test_pid, {:phase, 1, changeset.phase})
+        {:ok, record}
+      end)
+      |> Ash.Changeset.after_action(fn changeset, record ->
+        send(test_pid, {:phase, 2, changeset.phase})
+        {:ok, record}
+      end)
+      |> Ash.create!()
+
+      assert_received {:phase, 1, :after_action}
+      assert_received {:phase, 2, :after_action}
+    end
+  end
+
   describe "get_attribute/2" do
     setup do
       category =
@@ -1379,6 +1400,36 @@ defmodule Ash.Test.Changeset.ChangesetTest do
 
       assert Ash.Changeset.get_argument(changeset, :true_optional_argument) == true
       assert Ash.Changeset.get_argument(changeset, :false_optional_argument) == false
+    end
+
+    test "arguments not defined on the action add an error" do
+      changeset =
+        Category
+        |> Ash.Changeset.for_create(:create_with_confirmation)
+        |> Ash.Changeset.force_set_argument(:unknown_argument, "foo")
+
+      assert Enum.any?(changeset.errors, fn error ->
+               match?(%Ash.Error.Invalid.NoSuchInput{input: :unknown_argument}, error)
+             end)
+
+      refute Map.has_key?(changeset.arguments, :unknown_argument)
+      assert is_nil(changeset.arguments[nil])
+    end
+
+    test "arguments set before choosing an action are checked against its declarations" do
+      changeset =
+        Category
+        |> Ash.Changeset.new()
+        |> Ash.Changeset.set_argument(:unknown_argument, "foo")
+
+      assert changeset.valid?
+
+      changeset = Ash.Changeset.for_create(changeset, :create)
+
+      refute changeset.valid?
+
+      assert [%Ash.Error.Invalid.NoSuchInput{input: :unknown_argument, action: :create}] =
+               changeset.errors
     end
   end
 

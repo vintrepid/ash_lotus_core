@@ -54,16 +54,46 @@ defmodule Ash.Policy.Policy do
           check_context :: Check.context()
         ) :: Expression.t(Check.ref())
   def expression(policies, check_context) do
+    policies = List.wrap(policies)
+
+    check_context
+    |> Map.get(:resource)
+    |> Ash.Policy.Info.field_policy_expressions()
+    |> Map.get(policies)
+    |> case do
+      nil -> policies |> raw_expression() |> simplify_policy_expression(check_context)
+      expression -> expression
+    end
+    |> expand_invariants(check_context)
+  end
+
+  @spec raw_expression(policies :: t() | FieldPolicy.t() | [t() | FieldPolicy.t()]) ::
+          Expression.t(Check.ref())
+  defp raw_expression(policies) do
+    policies
+    |> fold_policies({false, true})
+    |> close_policy_fold()
+  end
+
+  # Folds `policies`, right to left, onto `{one_condition_matches,
+  # all_policies_match}`. What a policy contributes depends only on the policies
+  # to its right, so the fold of a list can be resumed from the fold of any of
+  # its suffixes. This is what lets the domain's policies (which come first) be
+  # composed with the resource's cached expressions, see `domain_template/2`.
+  @spec fold_policies(
+          policies :: t() | FieldPolicy.t() | [t() | FieldPolicy.t()],
+          acc :: {Expression.t(Check.ref()), Expression.t(Check.ref())}
+        ) :: {Expression.t(Check.ref()), Expression.t(Check.ref())}
+  defp fold_policies(policies, acc) do
     policies
     |> List.wrap()
     |> Enum.map(fn policy ->
-      # Simplification is important here to detect empty field policies
-      cond_expr = policy |> condition_expression() |> simplify_policy_expression(check_context)
+      cond_expr = condition_expression(policy)
       pol_expr = policies_expression(policy)
       complete_expr = b(cond_expr and pol_expr)
       {policy, cond_expr, complete_expr}
     end)
-    |> List.foldr({false, true}, fn
+    |> List.foldr(acc, fn
       {%{bypass?: true}, _cond_expr, complete_expr},
       {one_condition_matches, all_policies_match} ->
         {
@@ -79,14 +109,20 @@ defmodule Ash.Policy.Policy do
           b(implied_by(complete_expr, cond_expr) and all_policies_match)
         }
     end)
-    |> then(&b(elem(&1, 0) and elem(&1, 1)))
-    |> simplify_policy_expression(check_context)
-    |> expand_invariants(check_context)
   end
+
+  @spec close_policy_fold({Expression.t(Check.ref()), Expression.t(Check.ref())}) ::
+          Expression.t(Check.ref())
+  defp close_policy_fold({false, _all_policies_match}), do: false
+  defp close_policy_fold({true, all_policies_match}), do: all_policies_match
+  defp close_policy_fold({one_condition_matches, true}), do: one_condition_matches
+
+  defp close_policy_fold({one_condition_matches, all_policies_match}),
+    do: b(one_condition_matches and all_policies_match)
 
   @spec solve(authorizer :: Authorizer.t()) ::
           {:ok, boolean() | list(map), Authorizer.t()}
-          | {:error, Authorizer.t(), Ash.Error.t()}
+          | {:error, Authorizer.t(), Ash.Error.t() | :unsatisfiable}
   def solve(authorizer) do
     check_context = check_context(authorizer)
 
@@ -247,15 +283,353 @@ defmodule Ash.Policy.Policy do
           check_context :: Check.context()
         ) :: {Expression.t(Check.ref()), Authorizer.t()}
   defp build_requirements_expression(authorizer, check_context) do
+    {expression, authorizer} = starting_expression(authorizer, check_context)
+
     {expression, authorizer} =
-      authorizer.policies
-      |> expression(check_context)
-      |> simplify_policy_expression(check_context)
-      |> expand_constants(authorizer, check_context)
+      expression
+      |> simplify_checks(check_context)
+      |> fold_constants(authorizer)
+
+    expression =
+      if is_boolean(expression) do
+        expression
+      else
+        expression
+        |> expand_invariants(check_context)
+        |> Expression.simplify()
+      end
 
     authorizer = %{authorizer | solver_statement: expression}
 
     {expression, authorizer}
+  end
+
+  @action_checks [
+    Ash.Policy.Check.Action,
+    Ash.Policy.Check.ActionType,
+    Ash.Policy.Check.PrivateAction
+  ]
+
+  # Checks whose `simplify/2` we can safely call at compile time, i.e. the ones
+  # shipped with Ash. User defined checks are left as-is (their `simplify/2` is
+  # applied at runtime if the expression does not resolve statically).
+  @statically_simplifiable [Ash.Policy.Check.Static, Ash.Policy.Check.ActorAbsent] ++
+                             @action_checks
+
+  @doc false
+  # Builds the boolean expression for `policies` and simplifies it without any
+  # knowledge of the request, except (optionally) the action. Used at compile
+  # time by `Ash.Policy.Authorizer.Transformers.CachePolicyExpressions`.
+  @spec static_expression(
+          policies :: [t() | FieldPolicy.t()],
+          resource :: Ash.Resource.t(),
+          action :: Ash.Resource.Actions.action() | nil
+        ) :: Expression.t(Check.ref())
+  def static_expression(policies, resource, action) do
+    policies
+    |> raw_expression()
+    |> static_simplify(resource, action)
+  end
+
+  @doc false
+  # Like `static_expression/3`, but leaves the fold open, returning
+  # `{one_condition_matches, all_policies_match}` so that the domain's policies
+  # can be composed on top of it at runtime (see `domain_template/2`).
+  @spec static_fold(
+          policies :: [t()],
+          resource :: Ash.Resource.t(),
+          action :: Ash.Resource.Actions.action() | nil
+        ) :: {Expression.t(Check.ref()), Expression.t(Check.ref())}
+  def static_fold(policies, resource, action) do
+    {one_condition_matches, all_policies_match} = fold_policies(policies, {false, true})
+
+    {static_simplify(one_condition_matches, resource, action),
+     static_simplify(all_policies_match, resource, action)}
+  end
+
+  @doc false
+  # What the resource caches: the open fold (for composing with the domain's
+  # policies) and, when closing the fold alone would lose simplifications that
+  # span both of its sides, the closed and simplified expression. Otherwise the
+  # expression is `nil`, and is the closed fold.
+  @spec static_cache_entry(
+          policies :: [t()],
+          resource :: Ash.Resource.t(),
+          action :: Ash.Resource.Actions.action() | nil
+        ) ::
+          {{Expression.t(Check.ref()), Expression.t(Check.ref())},
+           Expression.t(Check.ref()) | nil}
+  def static_cache_entry(policies, resource, action) do
+    {one_condition_matches, _} = fold = static_fold(policies, resource, action)
+    closed_fold = close_policy_fold(fold)
+
+    expression =
+      if is_boolean(one_condition_matches) do
+        closed_fold
+      else
+        Expression.simplify(closed_fold)
+      end
+
+    if expression == closed_fold do
+      {fold, nil}
+    else
+      {fold, expression}
+    end
+  end
+
+  # Stand-ins for the fold of the resource's policies in `domain_template/2`.
+  @rest_one_condition_matches {__MODULE__, :rest_one_condition_matches}
+  @rest_all_policies_match {__MODULE__, :rest_all_policies_match}
+
+  @doc false
+  # Builds the expression for a domain's policies on top of the placeholders
+  # for the resource's (open) fold, simplified with what is known at compile
+  # time. The domain's policies come first, so the full expression is this
+  # template with the placeholders replaced by `static_fold/3` of the
+  # resource's policies. The domain's action checks can't be resolved here, as
+  # the actions belong to the resource, so they are resolved when composing.
+  @spec domain_template(policies :: [t()], domain :: Ash.Domain.t()) ::
+          Expression.t(Check.ref())
+  def domain_template(policies, domain) do
+    policies
+    |> fold_policies({@rest_one_condition_matches, @rest_all_policies_match})
+    |> close_policy_fold()
+    |> static_simplify(domain, nil)
+  end
+
+  @spec static_simplify(
+          expression :: Expression.t(Check.ref()),
+          resource :: Ash.Resource.t() | Ash.Domain.t(),
+          action :: Ash.Resource.Actions.action() | nil
+        ) :: Expression.t(Check.ref())
+  defp static_simplify(expression, resource, action) do
+    check_context = %{resource: resource}
+
+    expression
+    |> Expression.postwalk(fn
+      {check, opts} = ref when is_variable(ref) ->
+        cond do
+          action && check in @action_checks ->
+            check.match?(nil, %{action: action, resource: resource}, opts)
+
+          check in @statically_simplifiable ->
+            Check.simplify(check, ref, check_context)
+
+          true ->
+            ref
+        end
+
+      other ->
+        other
+    end)
+    |> Expression.simplify()
+  end
+
+  @spec starting_expression(Authorizer.t(), Check.context()) ::
+          {Expression.t(Check.ref()), Authorizer.t()}
+  defp starting_expression(
+         %Authorizer{resource: resource, policies: policies, action: action} = authorizer,
+         check_context
+       ) do
+    resource_expressions = Ash.Policy.Info.policy_expressions(resource)
+
+    cond do
+      resource_expressions && resource_expressions.policies == policies ->
+        case action && Map.fetch(resource_expressions.by_action, action.name) do
+          {:ok, entry} ->
+            # The action checks were resolved at compile time, but their results
+            # are still expected in `facts` (e.g. by the policy breakdown).
+            {cached_expression(entry), add_action_facts(authorizer)}
+
+          _ ->
+            {cached_expression(resource_expressions.overall), authorizer}
+        end
+
+      # Domain policies are prepended at runtime, in which case we compose the
+      # domain's cached template with the resource's cached fold.
+      template =
+          action && resource_expressions && domain_template_for(authorizer, resource_expressions) ->
+        {fold, _expression} =
+          case Map.fetch(resource_expressions.by_action, action.name) do
+            {:ok, entry} -> entry
+            :error -> resource_expressions.overall
+          end
+
+        {compose_domain_template(template, fold, resource, action), add_action_facts(authorizer)}
+
+      expression = Ash.Policy.Info.field_policy_expressions(resource)[policies] ->
+        {expression, authorizer}
+
+      # Anything unexpected falls back to building the expression, specialized
+      # for the action when there is one.
+      action && policies ->
+        {static_expression(policies, resource, action), add_action_facts(authorizer)}
+
+      true ->
+        {policies |> raw_expression() |> simplify_policy_expression(check_context), authorizer}
+    end
+  end
+
+  defp cached_expression({fold, nil}), do: close_policy_fold(fold)
+  defp cached_expression({_fold, expression}), do: expression
+
+  # The domain's cached template, if the policies being checked are exactly the
+  # domain's policies followed by the resource's.
+  @spec domain_template_for(Authorizer.t(), map()) :: Expression.t(Check.ref()) | nil
+  defp domain_template_for(%Authorizer{domain: nil}, _resource_expressions), do: nil
+
+  defp domain_template_for(
+         %Authorizer{domain: domain, policies: policies},
+         %{policies: resource_policies}
+       ) do
+    with %{policies: domain_policies, template: template} <-
+           Ash.Policy.Info.domain_policy_expression(domain),
+         {:ok, ^resource_policies} <- strip_prefix(policies, domain_policies) do
+      template
+    else
+      _ -> nil
+    end
+  end
+
+  defp strip_prefix(list, []), do: {:ok, list}
+  defp strip_prefix([item | list], [item | prefix]), do: strip_prefix(list, prefix)
+  defp strip_prefix(_list, _prefix), do: :error
+
+  @doc false
+  # Replaces the placeholders in a domain's template with the resource's fold
+  # and resolves the domain's action checks, folding away the branches that
+  # become constant (no boolean rewriting, and no checks are run).
+  @spec compose_domain_template(
+          template :: Expression.t(Check.ref()),
+          fold :: {Expression.t(Check.ref()), Expression.t(Check.ref())},
+          resource :: Ash.Resource.t(),
+          action :: Ash.Resource.Actions.action()
+        ) :: Expression.t(Check.ref())
+  def compose_domain_template(
+        template,
+        {one_condition_matches, all_policies_match},
+        resource,
+        action
+      ) do
+    # `postwalk` doesn't descend into what it substitutes, so the resource's
+    # (already specialized) fold is not walked again.
+    Expression.postwalk(template, fn
+      @rest_one_condition_matches ->
+        one_condition_matches
+
+      @rest_all_policies_match ->
+        all_policies_match
+
+      {check, opts} = ref when is_variable(ref) and check in @action_checks ->
+        check.match?(nil, %{action: action, resource: resource}, opts)
+
+      b(false and _) ->
+        false
+
+      b(_ and false) ->
+        false
+
+      b(true and right) ->
+        right
+
+      b(left and true) ->
+        left
+
+      b(true or _) ->
+        true
+
+      b(_ or true) ->
+        true
+
+      b(false or right) ->
+        right
+
+      b(left or false) ->
+        left
+
+      b(not value) when is_boolean(value) ->
+        not value
+
+      other ->
+        other
+    end)
+  end
+
+  @spec add_action_facts(Authorizer.t()) :: Authorizer.t()
+  defp add_action_facts(%Authorizer{policies: policies} = authorizer) do
+    policies
+    |> Enum.flat_map(fn policy ->
+      List.wrap(policy.condition) ++
+        Enum.map(policy.policies, &{&1.check_module, &1.check_opts})
+    end)
+    |> Enum.filter(fn {check, _opts} -> check in @action_checks end)
+    |> Enum.reduce(authorizer, fn ref, authorizer ->
+      case fetch_or_strict_check_fact(authorizer, ref) do
+        {:ok, _, authorizer} -> authorizer
+        {:error, authorizer} -> authorizer
+      end
+    end)
+  end
+
+  # Evaluates every check reference that can be strict checked to a boolean
+  # and folds the result through `and`/`or`/`not`, short-circuiting so that
+  # checks in branches whose outcome is already determined are never run.
+  #
+  # This is purely constant folding: no boolean rewriting is performed, which
+  # keeps it cheap. Anything left over is handed to the full pipeline.
+  @spec fold_constants(
+          expression :: Expression.t(Check.ref()),
+          authorizer :: Authorizer.t()
+        ) :: {Expression.t(Check.ref()), Authorizer.t()}
+  defp fold_constants(expression, authorizer) when is_boolean(expression),
+    do: {expression, authorizer}
+
+  defp fold_constants(b(left and right), authorizer) do
+    case fold_constants(left, authorizer) do
+      {false, authorizer} ->
+        {false, authorizer}
+
+      {true, authorizer} ->
+        fold_constants(right, authorizer)
+
+      {left, authorizer} ->
+        case fold_constants(right, authorizer) do
+          {false, authorizer} -> {false, authorizer}
+          {true, authorizer} -> {left, authorizer}
+          {right, authorizer} -> {b(left and right), authorizer}
+        end
+    end
+  end
+
+  defp fold_constants(b(left or right), authorizer) do
+    case fold_constants(left, authorizer) do
+      {true, authorizer} ->
+        {true, authorizer}
+
+      {false, authorizer} ->
+        fold_constants(right, authorizer)
+
+      {left, authorizer} ->
+        case fold_constants(right, authorizer) do
+          {true, authorizer} -> {true, authorizer}
+          {false, authorizer} -> {left, authorizer}
+          {right, authorizer} -> {b(left or right), authorizer}
+        end
+    end
+  end
+
+  defp fold_constants(b(not expression), authorizer) do
+    case fold_constants(expression, authorizer) do
+      {value, authorizer} when is_boolean(value) -> {not value, authorizer}
+      {expression, authorizer} -> {b(not expression), authorizer}
+    end
+  end
+
+  defp fold_constants(expression, authorizer) when is_variable(expression) do
+    case fetch_or_strict_check_fact(authorizer, expression) do
+      {:ok, result, authorizer} -> {result, authorizer}
+      {:error, authorizer} -> {expression, authorizer}
+    end
   end
 
   @spec fetch_or_strict_check_fact(
@@ -394,37 +768,24 @@ defmodule Ash.Policy.Policy do
     end)
   end
 
-  @spec expand_constants(
-          expression :: Expression.t(Check.ref()),
-          authorizer :: Authorizer.t(),
-          check_context :: Check.context()
-        ) :: {Expression.t(Check.ref()), Authorizer.t()}
-  defp expand_constants(expression, authorizer, check_context) do
-    {expression, authorizer} =
-      Expression.expand(expression, authorizer, fn
-        expr, authorizer when is_variable(expr) ->
-          case fetch_or_strict_check_fact(authorizer, expr) do
-            {:ok, result, authorizer} ->
-              {result, authorizer}
-
-            {:error, authorizer} ->
-              {expr, authorizer}
-          end
-
-        other, authorizer ->
-          {other, authorizer}
-      end)
-
-    {simplify_policy_expression(expression, check_context), authorizer}
-  end
-
   @spec simplify_policy_expression(
           expression :: Expression.t(Check.ref()),
           context :: Check.context()
         ) :: Expression.t(Check.ref())
   defp simplify_policy_expression(expression, context) do
     expression
-    |> Expression.postwalk(fn
+    |> simplify_checks(context)
+    |> Expression.simplify()
+  end
+
+  # Applies every check's `simplify/2` (see `Ash.Policy.Check`), without any
+  # boolean rewriting.
+  @spec simplify_checks(
+          expression :: Expression.t(Check.ref()),
+          context :: Check.context()
+        ) :: Expression.t(Check.ref())
+  defp simplify_checks(expression, context) do
+    Expression.postwalk(expression, fn
       {check, _opts} = expr when is_variable(expr) ->
         Code.ensure_loaded!(check)
 
@@ -437,7 +798,6 @@ defmodule Ash.Policy.Policy do
       other ->
         other
     end)
-    |> Expression.simplify()
   end
 
   @doc false
@@ -473,33 +833,20 @@ defmodule Ash.Policy.Policy do
       Code.ensure_loaded!(check)
     end
 
-    expression =
-      for {check, _} = left <- unique_variables,
-          right <- unique_variables,
-          left != right,
-          reduce: expression do
-        acc ->
-          cond do
-            not function_exported?(check, :implies?, 3) ->
-              acc
-
-            Ash.Policy.Check.implies?(check, left, right, check_context) ->
-              b(acc and implies(left, right))
-
-            true ->
-              acc
-          end
-      end
-
     for {check, _} = left <- unique_variables,
         right <- unique_variables,
         left != right,
         reduce: expression do
       acc ->
         cond do
-          not function_exported?(check, :conflict?, 3) -> acc
-          check.conflict?(left, right, check_context) -> b(acc and nand(left, right))
-          true -> acc
+          not function_exported?(check, :implies?, 3) ->
+            acc
+
+          Ash.Policy.Check.implies?(check, left, right, check_context) ->
+            b(acc and implies(left, right))
+
+          true ->
+            acc
         end
     end
   end

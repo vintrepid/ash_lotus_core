@@ -66,6 +66,7 @@ defmodule Ash.Changeset do
     :resource,
     :tenant,
     :to_tenant,
+    :as_of,
     :timeout,
     dirty_hooks: [],
     invalid_keys: MapSet.new(),
@@ -238,7 +239,7 @@ defmodule Ash.Changeset do
   @type after_action_fun ::
           (t, Ash.Resource.Record.t() ->
              {:ok, Ash.Resource.Record.t()}
-             | {:ok, Ash.Resource.Record.t(), [Ash.Notifier.Notification.t()]}
+             | {:ok, Ash.Resource.Record.t(), Ash.Notifier.Notification.input()}
              | {:error, any})
 
   @typedoc """
@@ -256,7 +257,7 @@ defmodule Ash.Changeset do
 
   Receives a changeset and returns a modified changeset, optionally with notifications.
   """
-  @type before_action_fun :: (t -> t | {t, %{notifications: [Ash.Notifier.Notification.t()]}})
+  @type before_action_fun :: (t -> t | {t, Ash.Notifier.Notification.input()})
 
   @typedoc """
   Function type for before transaction hooks.
@@ -676,29 +677,67 @@ defmodule Ash.Changeset do
       iex> changeset.load
       [:author, :comments]
 
+      # Only select the listed fields on a related record
+      iex> changeset = Ash.Changeset.for_create(MyApp.Post, :create, %{title: "My Post"})
+      iex> changeset = Ash.Changeset.load(changeset, [author: [:name]], strict?: true)
+
+  ## Options
+
+  - `strict?` - If set to true, only the fields listed for a relationship are loaded on it,
+    as with `Ash.Query.load/3`. Defaults to `false`.
+
   ## See also
 
   - `select/3` for controlling which attributes are returned
   - `loading?/2` for checking if something is being loaded
-  - `Ash.Query.load/2` for loading in queries
+  - `Ash.Query.load/3` for loading in queries
   - `Ash.ActionInput.load/2` for loading in generic actions
   """
-  @spec load(t(), term()) :: t()
-  def load(changeset, load) do
+  @spec load(t(), term(), Keyword.t()) :: t()
+  def load(changeset, load, opts \\ []) do
     query =
       changeset.resource
       |> Ash.Query.new()
       |> Map.put(:errors, [])
       |> Ash.Query.load(changeset.load)
-      |> Ash.Query.load(load)
+      |> Ash.Query.load(load, opts)
 
-    changeset = %{
-      changeset
-      | load: Enum.concat(changeset.load || [], List.wrap(load))
-    }
+    # As in `Ash.Query.load/2`, loading a plain attribute just ensures it is selected.
+    {attributes, load} =
+      load
+      |> List.wrap()
+      |> Enum.split_with(&(is_atom(&1) && Ash.Resource.Info.attribute(changeset.resource, &1)))
+
+    load =
+      if opts[:strict?] do
+        Enum.map(load, &strict_load(changeset.resource, &1))
+      else
+        load
+      end
+
+    changeset =
+      if attributes == [] do
+        changeset
+      else
+        ensure_selected(changeset, attributes)
+      end
+
+    changeset = %{changeset | load: Enum.concat(changeset.load || [], load)}
 
     Enum.reduce(query.errors, changeset, &add_error(&2, &1))
   end
+
+  # The changeset holds a load statement rather than a query, so a relationship loaded
+  # strictly is stored as the related query that a strict `Ash.Query.load/3` builds for it.
+  defp strict_load(resource, {name, _statement} = load) when is_atom(name) do
+    if Ash.Resource.Info.relationship(resource, name) do
+      {name, Keyword.fetch!(Ash.Query.load(resource, [load], strict?: true).load, name)}
+    else
+      load
+    end
+  end
+
+  defp strict_load(_resource, load), do: load
 
   @doc """
   Ensures that the given attributes are selected.
@@ -717,7 +756,7 @@ defmodule Ash.Changeset do
         Ash.Resource.Info.selected_by_default_attribute_names(changeset.resource)
         |> MapSet.to_list()
 
-      Ash.Changeset.select(changeset, to_select)
+      Ash.Changeset.select(changeset, to_select ++ List.wrap(fields))
     end
   end
 
@@ -836,9 +875,15 @@ defmodule Ash.Changeset do
           opts
         )
 
+      # This changeset is rebuilt from scratch (carrying context but not every
+      # field); restore the temporal `as_of` from the carried context so it is
+      # not lost on the way to the data layer.
+      changeset =
+        pin_temporal_write_now(%{changeset | as_of: changeset.context[:private][:as_of]})
+
       changeset = set_phase(changeset, :atomic)
 
-      with :ok <- verify_notifiers_support_atomic(resource, action),
+      with :ok <- verify_notifiers_support_atomic(resource, action, opts),
            %Ash.Changeset{} = changeset <-
              atomic_params(changeset, action, params, opts),
            %Ash.Changeset{} = changeset <- set_argument_defaults(changeset, action),
@@ -939,6 +984,24 @@ defmodule Ash.Changeset do
     end)
     |> Enum.reduce_while(changeset, fn attribute, changeset ->
       cond do
+        # `now()` would resolve to the write's `as_of`, but `recorded_at` is the wall clock.
+        recorded_at_attribute?(changeset, attribute) and
+            Ash.Helpers.now_default?(attribute.update_default) ->
+          recorded_at = temporal_recorded_at(changeset)
+
+          {:cont,
+           atomic_update(
+             changeset,
+             attribute.name,
+             {:atomic,
+              atomic_default_condition(
+                initial_changeset,
+                attribute.name,
+                Ash.Expr.expr(^recorded_at),
+                opts
+              )}
+           )}
+
         attribute.update_default == (&DateTime.utc_now/0) ->
           {:cont,
            atomic_update(
@@ -995,7 +1058,7 @@ defmodule Ash.Changeset do
       if opts[:reference_changes_via_conflict?] do
         changeset.atomics ++
           Enum.map(changeset.attributes, fn {attr, _value} ->
-            {attr, %Ash.Query.UpsertConflict{attribute: attr}}
+            {attr, %Ash.Query.UpsertConflict{attribute: attr, resource: changeset.resource}}
           end)
       else
         changeset.atomics ++ Map.to_list(changeset.attributes)
@@ -1062,19 +1125,24 @@ defmodule Ash.Changeset do
     end)
   end
 
-  defp verify_notifiers_support_atomic(resource, action) do
-    resource
-    |> Ash.Resource.Info.notifiers()
-    |> Enum.filter(fn notifier ->
-      Ash.Notifier.requires_original_data?(notifier, resource, action)
-    end)
-    |> case do
-      [] ->
-        :ok
+  defp verify_notifiers_support_atomic(resource, action, opts) do
+    # Original data is only needed to build notifications, so skip the check when there won't be any
+    if opts[:notify?] == false and !opts[:return_notifications?] do
+      :ok
+    else
+      resource
+      |> Ash.Resource.Info.notifiers()
+      |> Enum.filter(fn notifier ->
+        Ash.Notifier.requires_original_data?(notifier, resource, action)
+      end)
+      |> case do
+        [] ->
+          :ok
 
-      notifiers ->
-        {:not_atomic,
-         "notifiers #{inspect(notifiers)} require original data for #{inspect(resource)}.#{action.name}"}
+        notifiers ->
+          {:not_atomic,
+           "notifiers #{inspect(notifiers)} require original data for #{inspect(resource)}.#{action.name}"}
+      end
     end
   end
 
@@ -1103,16 +1171,31 @@ defmodule Ash.Changeset do
     changeset = set_phase(changeset, :atomic)
 
     Enum.reduce_while(changes, changeset, fn
-      %{change: _} = change, changeset ->
+      %{change: {module, _}} = change, changeset ->
+        context = Map.put(context, :source_context, changeset.context)
+
         case run_atomic_change(changeset, change, context) do
           {:not_atomic, reason} ->
             {:halt, {:not_atomic, reason}}
 
-          changeset ->
-            {:cont, changeset}
+          %__MODULE__{} = new_changeset ->
+            case atomic_unsupported_hooks_added(changeset, new_changeset) do
+              [] ->
+                {:cont, new_changeset}
+
+              hooks ->
+                {:halt,
+                 {:not_atomic,
+                  "change `#{inspect(module)}` added #{Enum.map_join(hooks, ", ", &"`#{&1}`")} hooks, which cannot run when the action is done atomically"}}
+            end
+
+          other ->
+            {:cont, other}
         end
 
       %{validation: _} = validation, changeset ->
+        context = Map.put(context, :source_context, changeset.context)
+
         case run_atomic_validation(changeset, validation, context) do
           {:not_atomic, reason} ->
             {:halt, {:not_atomic, reason}}
@@ -1125,6 +1208,21 @@ defmodule Ash.Changeset do
       {:not_atomic, reason} -> {:not_atomic, reason}
       %__MODULE__{} = changeset -> clear_phase(changeset)
     end
+  end
+
+  # An atomic action only runs `after_action` and `after_transaction` hooks, so hooks of any
+  # other kind that an `atomic/3` callback adds would silently never run.
+  @atomic_unsupported_hooks [
+    :around_transaction,
+    :before_transaction,
+    :around_action,
+    :before_action
+  ]
+
+  defp atomic_unsupported_hooks_added(changeset, new_changeset) do
+    Enum.filter(@atomic_unsupported_hooks, fn hook ->
+      Map.fetch!(new_changeset, hook) != Map.fetch!(changeset, hook)
+    end)
   end
 
   @doc false
@@ -1369,10 +1467,10 @@ defmodule Ash.Changeset do
         new_changeset
 
       {{:error, error}, _condition} ->
-        {:error, error}
+        add_error(changeset, error)
 
       {:error, error} ->
-        {:error, error}
+        add_error(changeset, error)
 
       {{:not_atomic, reason}, _} ->
         {:not_atomic, reason}
@@ -1456,7 +1554,7 @@ defmodule Ash.Changeset do
         end
 
       {:error, error} ->
-        {:cont, add_invalid_errors(value, :attribute, changeset, attribute, error)}
+        add_invalid_errors(value, :attribute, changeset, attribute, error)
     end
   end
 
@@ -1737,6 +1835,9 @@ defmodule Ash.Changeset do
       end
     end)
     |> case do
+      {:not_atomic, reason} ->
+        {:not_atomic, reason}
+
       {:atomic, expr} ->
         case Ash.Expr.eval(expr,
                resource: changeset.resource,
@@ -1942,6 +2043,11 @@ defmodule Ash.Changeset do
       type: {:protocol, Ash.ToTenant},
       doc: "set the tenant on the changeset"
     ],
+    as_of: [
+      type: {:or, [{:struct, DateTime}, {:struct, Ash.Range}, {:literal, :now}, {:literal, nil}]},
+      doc:
+        "set the `as_of` point in time on the changeset (time travel). See `Ash.Changeset.as_of/2`."
+    ],
     skip_unknown_inputs: [
       type: {:wrap_list, {:or, [:atom, :string]}},
       doc:
@@ -1950,6 +2056,14 @@ defmodule Ash.Changeset do
     load: [
       type: :any,
       doc: "Data to load on the result after running the action."
+    ],
+    strict?: [
+      type: :boolean,
+      default: false,
+      doc: """
+      If set to true, only the fields listed for a relationship in `load` are loaded on it.
+      See `load/3`.
+      """
     ],
     context: [
       type: :map,
@@ -2328,7 +2442,7 @@ defmodule Ash.Changeset do
               |> set_actor(opts)
               |> set_authorize(opts)
               |> set_tracer(opts)
-              |> load(opts[:load])
+              |> load(opts[:load], Keyword.take(opts, [:strict?]))
               |> set_tenant(opts[:tenant] || changeset.tenant)
               |> cast_params(action, params, opts)
               |> set_argument_defaults(action)
@@ -3155,11 +3269,16 @@ defmodule Ash.Changeset do
     |> set_actor(opts)
     |> set_authorize(opts)
     |> set_tracer(opts)
-    |> load(opts[:load])
+    |> load(opts[:load], Keyword.take(opts, [:strict?]))
     |> timeout(changeset.timeout || opts[:timeout])
     |> set_tenant(opts[:tenant] || changeset.tenant || changeset.data.__metadata__[:tenant])
+    |> maybe_set_as_of(opts[:as_of] || changeset.as_of)
     |> Map.put(:action_type, action.type)
   end
+
+  # Apply an `as_of` from opts without clobbering an unset changeset when there is none.
+  defp maybe_set_as_of(changeset, nil), do: changeset
+  defp maybe_set_as_of(changeset, value), do: as_of(changeset, value)
 
   defp reset_arguments(%{arguments: arguments} = changeset) do
     Enum.reduce(arguments, changeset, fn {key, value}, changeset ->
@@ -3308,6 +3427,11 @@ defmodule Ash.Changeset do
             actor: changeset.context[:private][:actor],
             authorize?: changeset.context[:private][:authorize?],
             tracer: changeset.context[:private][:tracer],
+            # Check uniqueness "as of" the write's instant: on a temporal resource the
+            # new row is `[as_of, ∞)`, so the conflicting set is the rows valid at `as_of`
+            # (an `@> as_of` read). `nil` (the default-`now()` write) leaves the read to
+            # default to `now()`, which matches the period the data layer will write.
+            as_of: changeset.as_of,
             domain: domain
           )
           |> Ash.Query.do_filter(values)
@@ -3371,7 +3495,12 @@ defmodule Ash.Changeset do
           else
             %{
               changeset
-              | arguments: Map.put(changeset.arguments, argument.name, default(:create, argument))
+              | arguments:
+                  Map.put(
+                    changeset.arguments,
+                    argument.name,
+                    default(changeset, :create, argument)
+                  )
             }
           end
 
@@ -3570,7 +3699,7 @@ defmodule Ash.Changeset do
     changes
     |> Enum.reduce(changeset, fn {location, change_or_validation}, changeset ->
       try do
-        context = %{context | tenant: changeset.tenant}
+        context = %{context | tenant: changeset.tenant, source_context: changeset.context}
 
         run_change_or_validation(
           change_or_validation,
@@ -4077,6 +4206,8 @@ defmodule Ash.Changeset do
   def set_defaults(changeset, action_type, lazy? \\ false)
 
   def set_defaults(changeset, :create, lazy?) do
+    changeset = pin_temporal_write_now(changeset)
+
     with_static_defaults =
       changeset.resource
       |> Ash.Resource.Info.static_default_attributes(:create)
@@ -4085,7 +4216,7 @@ defmodule Ash.Changeset do
           changeset
         else
           changeset
-          |> force_change_attribute(attribute.name, default(:create, attribute))
+          |> force_change_attribute(attribute.name, default(changeset, :create, attribute))
           |> Map.update!(:defaults, fn defaults ->
             [attribute.name | defaults]
           end)
@@ -4102,6 +4233,8 @@ defmodule Ash.Changeset do
   end
 
   def set_defaults(changeset, :update, lazy?) do
+    changeset = pin_temporal_write_now(changeset)
+
     with_static_defaults =
       changeset.resource
       |> Ash.Resource.Info.static_default_attributes(:update)
@@ -4110,7 +4243,7 @@ defmodule Ash.Changeset do
           changeset
         else
           changeset
-          |> force_change_attribute(attribute.name, default(:update, attribute))
+          |> force_change_attribute(attribute.name, default(changeset, :update, attribute))
           |> Map.update!(:defaults, fn defaults ->
             [attribute.name | defaults]
           end)
@@ -4143,7 +4276,7 @@ defmodule Ash.Changeset do
         changeset
       else
         changeset
-        |> force_change_attribute(attribute.name, default(type, attribute))
+        |> force_change_attribute(attribute.name, default(changeset, type, attribute))
         |> Map.update!(:defaults, fn defaults ->
           [attribute.name | defaults]
         end)
@@ -4165,20 +4298,24 @@ defmodule Ash.Changeset do
     end)
     |> Enum.reduce(changeset, fn {default_fun, attributes}, changeset ->
       default_value =
-        case default_fun do
-          function when is_function(function) ->
-            function.()
-
-          {m, f, a} when is_atom(m) and is_atom(f) and is_list(a) ->
-            apply(m, f, a)
-        end
+        Ash.Helpers.resolve_default(
+          default_fun,
+          Ash.Temporal.resolve_write_as_of(changeset.as_of)
+        )
 
       Enum.reduce(attributes, changeset, fn attribute, changeset ->
         if changing_attribute?(changeset, attribute.name) do
           changeset
         else
+          value =
+            if recorded_at_attribute?(changeset, attribute) do
+              Ash.Helpers.resolve_default(default_fun, temporal_recorded_at(changeset))
+            else
+              default_value
+            end
+
           changeset
-          |> force_change_attribute(attribute.name, default_value)
+          |> force_change_attribute(attribute.name, value)
           |> Map.update!(:defaults, fn defaults ->
             [attribute.name | defaults]
           end)
@@ -4187,16 +4324,58 @@ defmodule Ash.Changeset do
     end)
   end
 
-  defp default(:create, %{default: {mod, func, args}}), do: apply(mod, func, args)
-  defp default(:create, %{default: function}) when is_function(function, 0), do: function.()
-  defp default(:create, %{default: value}), do: value
+  # Pin a single `now` for a temporal write (as its `as_of`) when one isn't already set, so
+  # every `&DateTime.utc_now/0` default *and* the validity period the data layer derives
+  # from `as_of` share one instant — rather than each calling the wall clock separately and
+  # landing microseconds apart. Runs after any user-provided `as_of`, so it never clobbers
+  # an explicit time-travel write. No-op for non-temporal resources.
+  #
+  # The pinned instant is also what the resource's `recorded_at` attribute is stamped with,
+  # so a write that isn't back-dated records the same instant its period starts at.
+  @doc false
+  def pin_temporal_write_now(%{as_of: nil} = changeset) do
+    if Ash.Resource.Info.temporal?(changeset.resource) do
+      changeset = as_of(changeset, changeset.context[:private][:temporal_now] || :now)
 
-  defp default(:update, %{update_default: {mod, func, args}}), do: apply(mod, func, args)
+      case changeset.as_of do
+        %DateTime{} = now -> set_context(changeset, %{private: %{temporal_recorded_at: now}})
+        _ -> changeset
+      end
+    else
+      changeset
+    end
+  end
 
-  defp default(:update, %{update_default: function}) when is_function(function, 0),
-    do: function.()
+  def pin_temporal_write_now(changeset), do: changeset
 
-  defp default(:update, %{update_default: value}), do: value
+  # A `&DateTime.utc_now/0` default on a write that carries an `as_of` resolves to that
+  # instant rather than the wall clock (see `Ash.Helpers.resolve_default/2`), except on the
+  # resource's `recorded_at` attribute, which is always the time of the write itself.
+  defp default(changeset, :create, attribute),
+    do: Ash.Helpers.resolve_default(attribute.default, default_as_of(changeset, attribute))
+
+  defp default(changeset, :update, attribute) do
+    Ash.Helpers.resolve_default(attribute.update_default, default_as_of(changeset, attribute))
+  end
+
+  defp default_as_of(changeset, attribute) do
+    if recorded_at_attribute?(changeset, attribute) do
+      temporal_recorded_at(changeset)
+    else
+      Ash.Temporal.resolve_write_as_of(changeset.as_of)
+    end
+  end
+
+  defp recorded_at_attribute?(changeset, %{name: name}) do
+    name == Ash.Resource.Info.temporal_recorded_at(changeset.resource)
+  end
+
+  @doc false
+  # The instant a temporal write stamps its `recorded_at` attribute with: the `now` pinned
+  # for it, or the wall clock when it carries an explicit `as_of`.
+  def temporal_recorded_at(changeset) do
+    changeset.context[:private][:temporal_recorded_at] || DateTime.utc_now()
+  end
 
   defp validation_attribute(changeset) do
     case List.last(changeset.atomics) do
@@ -4662,6 +4841,7 @@ defmodule Ash.Changeset do
           |> Enum.uniq()
 
         notify? = !Process.put(:ash_started_transaction?, true)
+        queued_notifications = Process.get(:ash_notifications)
 
         resources = Enum.reject(resources, &Ash.DataLayer.in_transaction?/1)
 
@@ -4685,11 +4865,9 @@ defmodule Ash.Changeset do
               end
             end,
             changeset.timeout || :infinity,
-            Map.put(
-              opts[:transaction_metadata],
-              :data_layer_context,
-              changeset.context[:data_layer] || %{}
-            ),
+            opts[:transaction_metadata]
+            |> Map.put(:data_layer_context, changeset.context[:data_layer] || %{})
+            |> Map.put(:tenant, changeset.tenant),
             rollback_on_error?: false
           )
           |> case do
@@ -4697,11 +4875,27 @@ defmodule Ash.Changeset do
               {:ok, value, changeset, Map.put(instructions, :gather_notifications?, notify?)}
 
             {:ok, {:error, error}} ->
+              # The transaction was committed (`rollback_on_error?: false`), so
+              # anything queued inside of it is real and must be sent now.
+              if notify? do
+                remaining =
+                  Ash.Notifier.notify(Ash.Actions.Helpers.take_queued_notifications())
+
+                Ash.Actions.Helpers.warn_missed!(changeset.resource, changeset.action, %{
+                  resource_notifications: remaining
+                })
+              end
+
               {:error, error}
 
             {:error, error} ->
+              Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
               {:error, error}
           end
+        catch
+          kind, reason ->
+            if notify?, do: Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
+            :erlang.raise(kind, reason, __STACKTRACE__)
         after
           if notify? do
             Process.delete(:ash_started_transaction?)
@@ -4730,15 +4924,22 @@ defmodule Ash.Changeset do
     |> case do
       {:ok, value, changeset, instructions} ->
         if opts[:return_notifications?] do
-          {:ok, value, changeset, instructions}
+          if instructions[:gather_notifications?] do
+            # Notifications queued by nested actions in the transaction we started
+            # are returned along with our own, as they would otherwise never be sent
+            notifications =
+              Enum.concat(
+                Ash.Actions.Helpers.take_queued_notifications(),
+                instructions[:notifications] || []
+              )
+
+            {:ok, value, changeset, Map.put(instructions, :notifications, notifications)}
+          else
+            {:ok, value, changeset, instructions}
+          end
         else
           if Process.get(:ash_started_transaction?) do
-            current_notifications = List.wrap(Process.get(:ash_notifications, []))
-
-            Process.put(
-              :ash_notifications,
-              current_notifications ++ List.wrap(instructions[:notifications])
-            )
+            Ash.Actions.Helpers.queue_notifications(instructions[:notifications])
 
             {:ok, value, changeset, Map.put(instructions, :notifications, [])}
           else
@@ -4747,7 +4948,7 @@ defmodule Ash.Changeset do
 
             notifications =
               if instructions[:gather_notifications?] do
-                Enum.concat(List.wrap(Process.delete(:ash_notifications) || []), notifications)
+                Enum.concat(Ash.Actions.Helpers.take_queued_notifications(), notifications)
               else
                 notifications
               end
@@ -4985,6 +5186,7 @@ defmodule Ash.Changeset do
   def run_before_actions(%{valid?: false} = changeset), do: changeset
 
   def run_before_actions(changeset) do
+    changeset = set_phase(changeset, :before_action)
     can_do_atomic? = data_layer_can_do_atomic_for_changest?(changeset)
 
     Enum.reduce_while(
@@ -5020,7 +5222,9 @@ defmodule Ash.Changeset do
           {:error, error} ->
             {:halt, {:error, error}}
 
-          {changeset, %{notifications: notifications}} ->
+          {%Ash.Changeset{} = changeset, notification_input} ->
+            notifications = Ash.Notifier.Notification.normalize(notification_input)
+
             cont =
               if changeset.valid? do
                 :cont
@@ -5209,7 +5413,7 @@ defmodule Ash.Changeset do
           {:ok, new_result, new_notifications} ->
             all_notifications =
               Enum.map(
-                List.wrap(notifications) ++ List.wrap(new_notifications),
+                List.wrap(notifications) ++ Ash.Notifier.Notification.normalize(new_notifications),
                 fn notification ->
                   %{
                     notification
@@ -5228,11 +5432,10 @@ defmodule Ash.Changeset do
                 end
               )
 
-            {:cont,
-             {:ok, new_result, clear_phase(changeset), %{acc | notifications: all_notifications}}}
+            {:cont, {:ok, new_result, changeset, %{acc | notifications: all_notifications}}}
 
           {:ok, new_result} ->
-            {:cont, {:ok, new_result, clear_phase(changeset), acc}}
+            {:cont, {:ok, new_result, changeset, acc}}
 
           {:error, error} ->
             {:halt, {:error, error}}
@@ -5254,6 +5457,8 @@ defmodule Ash.Changeset do
     )
     |> case do
       {:ok, result, changeset, acc} ->
+        changeset = clear_phase(changeset)
+
         case run_authorize_results(changeset, result) do
           {:ok, result} ->
             {:ok, result, changeset, acc}
@@ -5480,6 +5685,41 @@ defmodule Ash.Changeset do
     %{changeset | tenant: tenant, to_tenant: Ash.ToTenant.to_tenant(tenant, changeset.resource)}
   end
 
+  @doc """
+  Pins a write to a temporal resource to an instant or a period.
+
+  `as_of` is an instant of the resource's period, or a range. An instant is where the
+  write takes effect: a create opens a period from it, and an update or destroy splits
+  the version valid at it. `:now`, the default when unset, is the current instant. A
+  range is the period the write applies to, and satisfies the period attribute's
+  constraints.
+
+  The write only guarantees its rules hold *at* `as_of`, at the time it is made —
+  exactly like any non-temporal write, which guarantees its validations only at write
+  time, not for any future moment.
+
+  `now()`/`ago()`/`from_now()` in validations and atomic changes resolve to
+  `as_of`. How (and whether) a period of validity is stored is up to the data
+  layer.
+  """
+  @spec as_of(t(), DateTime.t() | Ash.Range.t() | :now | nil) :: t()
+  def as_of(changeset, nil), do: changeset
+
+  def as_of(changeset, as_of) do
+    case Ash.Temporal.check_write_as_of(changeset.resource, as_of) do
+      {:ok, as_of} ->
+        # Read legs inherit the instant through `shared`; the range stays on `private`.
+        %{changeset | as_of: as_of}
+        |> set_context(%{
+          private: %{as_of: as_of},
+          shared: %{as_of: Ash.Temporal.resolve_write_as_of(as_of)}
+        })
+
+      {:error, error} ->
+        add_error(changeset, error)
+    end
+  end
+
   @spec timeout(t(), nil | pos_integer, nil | pos_integer) :: t()
   def timeout(changeset, timeout, default \\ nil) do
     %{changeset | timeout: timeout || default}
@@ -5494,15 +5734,30 @@ defmodule Ash.Changeset do
   def set_context(changeset, nil), do: changeset
 
   def set_context(changeset, map) do
-    %{
+    changeset = %{
       changeset
       | context:
           changeset.context
           |> Ash.Helpers.deep_merge_maps(map)
           |> then(&Ash.Helpers.deep_merge_maps(&1, map[:shared] || %{}))
     }
-    |> store_context_changes(map)
+
+    # `as_of` rides in the shared context so it propagates to related/managed records (the
+    # same channel multitenancy uses), and is mirrored onto the struct field here so the
+    # data layer threads it — symmetric with `Ash.Query.set_context/2`.
+    #
+    # `private` holds this write's own `as_of`, which may be a range, and wins.
+    changeset =
+      case fetch_context_as_of(changeset.context) do
+        {:ok, as_of} -> %{changeset | as_of: as_of}
+        :error -> changeset
+      end
+
+    store_context_changes(changeset, map)
   end
+
+  defp fetch_context_as_of(%{private: %{as_of: as_of}}), do: {:ok, as_of}
+  defp fetch_context_as_of(context), do: Map.fetch(context, :as_of)
 
   defp store_context_changes(%{phase: :pending} = changeset, map) do
     %{changeset | context_changes: Ash.Helpers.deep_merge_maps(changeset.context_changes, map)}
@@ -6614,33 +6869,44 @@ defmodule Ash.Changeset do
 
   defp do_set_argument(changeset, argument, value, store_casted? \\ false) do
     if changeset.action do
-      argument =
+      action_argument =
         Enum.find(
           changeset.action.arguments,
           &(&1.name == argument || to_string(&1.name) == argument)
         )
 
-      if argument do
-        with value <- Ash.Type.Helpers.handle_indexed_maps(argument.type, value),
+      if action_argument do
+        with value <- Ash.Type.Helpers.handle_indexed_maps(action_argument.type, value),
              constraints <-
-               Ash.Type.include_source(argument.type, changeset, argument.constraints),
+               Ash.Type.include_source(
+                 action_argument.type,
+                 changeset,
+                 action_argument.constraints
+               ),
              {:ok, casted} <-
-               Ash.Type.cast_input(argument.type, value, constraints),
+               Ash.Type.cast_input(action_argument.type, value, constraints),
              {{:ok, casted}, _last_val} <-
-               {Ash.Type.apply_constraints(argument.type, casted, constraints), casted} do
-          %{changeset | arguments: Map.put(changeset.arguments, argument.name, casted)}
-          |> store_casted_argument(argument.name, casted, store_casted?)
+               {Ash.Type.apply_constraints(action_argument.type, casted, constraints), casted} do
+          %{changeset | arguments: Map.put(changeset.arguments, action_argument.name, casted)}
+          |> store_casted_argument(action_argument.name, casted, store_casted?)
         else
           {:error, error} ->
-            add_invalid_errors(value, :argument, changeset, argument, error)
+            add_invalid_errors(value, :argument, changeset, action_argument, error)
 
           {{:error, error}, last_val} ->
-            add_invalid_errors(value, :argument, changeset, argument, error)
-            |> store_casted_argument(argument.name, last_val, store_casted?)
+            add_invalid_errors(value, :argument, changeset, action_argument, error)
+            |> store_casted_argument(action_argument.name, last_val, store_casted?)
         end
       else
-        %{changeset | arguments: Map.put(changeset.arguments, argument, value)}
-        |> store_casted_argument(argument, value, store_casted?)
+        add_error(
+          changeset,
+          NoSuchInput.exception(
+            resource: changeset.resource,
+            action: changeset.action.name,
+            input: argument,
+            inputs: Ash.Resource.Info.action_inputs(changeset.resource, changeset.action.name)
+          )
+        )
       end
     else
       %{changeset | arguments: Map.put(changeset.arguments, argument, value)}
@@ -6885,7 +7151,7 @@ defmodule Ash.Changeset do
               }
               |> store_casted_attribute(attribute.name, nil, store_casted?)
 
-            Ash.Type.equal?(attribute.type, casted, data_value) ->
+            Ash.Type.equal?(attribute.type, casted, data_value, attribute.constraints) ->
               %{
                 changeset
                 | attributes: Map.delete(changeset.attributes, attribute.name),
@@ -7025,7 +7291,8 @@ defmodule Ash.Changeset do
                   defaults: changeset.defaults -- [attribute.name]
               }
 
-            has_data_value? and Ash.Type.equal?(attribute.type, casted, data_value) ->
+            has_data_value? and
+                Ash.Type.equal?(attribute.type, casted, data_value, attribute.constraints) ->
               %{
                 changeset
                 | attributes: Map.delete(changeset.attributes, attribute.name),
@@ -7124,6 +7391,15 @@ defmodule Ash.Changeset do
       ...>       changeset
       ...>   end
       ...> end)
+
+    A `before_action` hook may return notifications in any of these forms:
+
+      {changeset, notification}
+      {changeset, [notification]}
+      {changeset, %{notifications: [notification]}}
+      {changeset, nil}
+
+    Returning `changeset` without a tuple is equivalent to returning no notifications.
 
   ## See also
 
@@ -7271,6 +7547,13 @@ defmodule Ash.Changeset do
       ...>
       ...>   {:ok, post}
       ...> end)
+
+    The notification value may also be returned as a single notification, a map containing a `:notifications` key, or `nil`:
+
+      {:ok, result, notification}
+      {:ok, result, [notification]}
+      {:ok, result, %{notifications: [notification]}}
+      {:ok, result, nil}
 
   ## See also
 

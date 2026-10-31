@@ -6,6 +6,8 @@ defmodule Ash.Test.Actions.ValidationTest do
   @moduledoc false
   use ExUnit.Case, async: true
 
+  require Ash.Query
+
   alias Ash.Test.Domain, as: Domain
 
   defmodule EmbeddedResource do
@@ -360,6 +362,122 @@ defmodule Ash.Test.Actions.ValidationTest do
     end
   end
 
+  describe "present with at_least/at_most on atomic updates" do
+    defmodule Contact do
+      @moduledoc false
+      use Ash.Resource,
+        domain: Domain,
+        data_layer: Ash.DataLayer.Ets
+
+      ets do
+        private? true
+      end
+
+      actions do
+        default_accept :*
+        defaults [:read, :destroy, create: :*]
+
+        update :update_at_least do
+          require_atomic? true
+          validate present([:email, :phone], at_least: 1)
+        end
+
+        update :update_at_most do
+          require_atomic? true
+          validate present([:email, :phone], at_most: 1)
+        end
+
+        update :update_at_least_custom_message do
+          require_atomic? true
+          validate present([:email, :phone], at_least: 1), message: "need a way to reach you"
+        end
+      end
+
+      attributes do
+        uuid_primary_key :id
+        attribute :email, :string, public?: true
+        attribute :phone, :string, public?: true
+      end
+    end
+
+    setup do
+      %{record: Contact |> Ash.Changeset.for_create(:create, %{email: "a@b.c"}) |> Ash.create!()}
+    end
+
+    test "at_least passes with valid input", %{record: record} do
+      assert %{phone: "555"} =
+               record
+               |> Ash.Changeset.for_update(:update_at_least, %{phone: "555"})
+               |> Ash.update!()
+    end
+
+    test "at_least fails when too few are present", %{record: record} do
+      assert_raise Ash.Error.Invalid, ~r/at least 1 of .* must be present/, fn ->
+        record
+        |> Ash.Changeset.for_update(:update_at_least, %{email: nil})
+        |> Ash.update!()
+      end
+    end
+
+    test "at_least works with an atomic bulk update", %{record: record} do
+      assert %Ash.BulkResult{status: :success} =
+               Contact
+               |> Ash.Query.filter(id == ^record.id)
+               |> Ash.bulk_update!(:update_at_least, %{phone: "555"}, strategy: :atomic)
+    end
+
+    test "at_most passes with valid input", %{record: record} do
+      assert %{email: "x@y.z"} =
+               record
+               |> Ash.Changeset.for_update(:update_at_most, %{email: "x@y.z"})
+               |> Ash.update!()
+    end
+
+    test "at_most fails when too many are present", %{record: record} do
+      assert_raise Ash.Error.Invalid, ~r/at most 1 of .* must be present/, fn ->
+        record
+        |> Ash.Changeset.for_update(:update_at_most, %{phone: "555"})
+        |> Ash.update!()
+      end
+    end
+
+    test "at_least fails in an atomic bulk update", %{record: record} do
+      assert %Ash.BulkResult{status: :error, errors: [error]} =
+               Contact
+               |> Ash.Query.filter(id == ^record.id)
+               |> Ash.bulk_update(:update_at_least, %{email: nil},
+                 strategy: :atomic,
+                 return_errors?: true
+               )
+
+      assert Exception.message(error) =~ ~s(at least 1 of "email, phone" must be present)
+    end
+
+    test "at_most fails in an atomic bulk update", %{record: record} do
+      assert %Ash.BulkResult{status: :error, errors: [error]} =
+               Contact
+               |> Ash.Query.filter(id == ^record.id)
+               |> Ash.bulk_update(:update_at_most, %{phone: "555"},
+                 strategy: :atomic,
+                 return_errors?: true
+               )
+
+      assert Exception.message(error) =~ ~s(at most 1 of "email, phone" must be present)
+    end
+
+    test "a custom message is used in an atomic bulk update", %{record: record} do
+      assert %Ash.BulkResult{status: :error, errors: [error]} =
+               Contact
+               |> Ash.Query.filter(id == ^record.id)
+               |> Ash.bulk_update(:update_at_least_custom_message, %{email: nil},
+                 strategy: :atomic,
+                 return_errors?: true
+               )
+
+      assert Exception.message(error) =~ "need a way to reach you"
+    end
+  end
+
   describe "sensitive value redaction in validation errors" do
     defmodule SensitiveResource do
       @moduledoc false
@@ -614,6 +732,84 @@ defmodule Ash.Test.Actions.ValidationTest do
           |> Ash.create!()
         end
       )
+    end
+  end
+
+  describe "validations returning multiple errors" do
+    defmodule MultipleErrors do
+      @moduledoc false
+      use Ash.Resource.Validation
+
+      @impl true
+      def validate(_changeset, _opts, _context) do
+        {:error, ["first error", "second error"]}
+      end
+    end
+
+    defmodule NeverRuns do
+      @moduledoc false
+      use Ash.Resource.Validation
+
+      @impl true
+      def validate(_changeset, _opts, _context) do
+        {:error, "this validation should have been skipped"}
+      end
+    end
+
+    defmodule MultiErrorProfile do
+      @moduledoc false
+      use Ash.Resource,
+        domain: Domain,
+        data_layer: Ash.DataLayer.Ets
+
+      ets do
+        private? true
+      end
+
+      attributes do
+        uuid_primary_key :id
+      end
+
+      actions do
+        default_accept :*
+        defaults [:read, :destroy, create: :*, update: :*]
+
+        create :multiple_errors do
+          validate {MultipleErrors, []}
+        end
+
+        create :only_when_valid do
+          validate {MultipleErrors, []}
+
+          validate {NeverRuns, []} do
+            only_when_valid? true
+          end
+        end
+      end
+    end
+
+    test "a validation returning a list of errors produces one error per item" do
+      assert {:error, error} =
+               MultiErrorProfile
+               |> Ash.Changeset.for_create(:multiple_errors, %{})
+               |> Ash.create()
+
+      assert [
+               %Ash.Error.Changes.InvalidChanges{message: "first error"},
+               %Ash.Error.Changes.InvalidChanges{message: "second error"}
+             ] = error.errors
+    end
+
+    test "`only_when_valid?` skips validations after a previous one returned multiple errors" do
+      assert {:error, error} =
+               MultiErrorProfile
+               |> Ash.Changeset.for_create(:only_when_valid, %{})
+               |> Ash.create()
+
+      assert [
+               %Ash.Error.Changes.InvalidChanges{message: "first error"},
+               %Ash.Error.Changes.InvalidChanges{message: "second error"}
+             ] = error.errors
     end
   end
 end

@@ -168,6 +168,7 @@ defmodule Ash.Query do
     :timeout,
     :lock,
     :to_tenant,
+    :as_of,
     sort_input_indices: [],
     before_transaction: [],
     after_transaction: [],
@@ -211,6 +212,7 @@ defmodule Ash.Query do
           filter: Ash.Filter.t() | nil,
           resource: module,
           tenant: term(),
+          as_of: DateTime.t() | :now | nil,
           combination_of: [Ash.Query.Combination.t()],
           timeout: pos_integer() | nil,
           action_failed?: boolean,
@@ -253,7 +255,8 @@ defmodule Ash.Query do
 
   @typedoc "Result type for around_transaction hooks, containing either successful records or an error."
   @type around_result ::
-          {:ok, list(Ash.Resource.Record.t())}
+          {:ok, list(Ash.Resource.Record.t()) | Ash.Page.page()}
+          | {:ok, list(Ash.Resource.Record.t()) | Ash.Page.page(), t}
           | {:error, Ash.Error.t()}
 
   @typedoc "Function type for before_transaction hooks that run before query execution."
@@ -265,7 +268,7 @@ defmodule Ash.Query do
              {:ok, list(Ash.Resource.Record.t())} | {:error, any})
 
   @typedoc "Function type for around_transaction hooks that wrap query execution in a transaction."
-  @type around_transaction_fun :: (t -> {:ok, Ash.Resource.Record.t()} | {:error, any})
+  @type around_transaction_fun :: (t, (t -> around_result) -> around_result)
 
   alias Ash.Actions.Sort
 
@@ -826,6 +829,10 @@ defmodule Ash.Query do
       type: {:protocol, Ash.ToTenant},
       doc: "set the tenant on the query"
     ],
+    as_of: [
+      type: {:or, [{:struct, DateTime}, {:literal, :now}, {:literal, nil}]},
+      doc: "set the `as_of` point in time on the query (time travel). See `Ash.Query.as_of/2`."
+    ],
     load: [
       type: :any,
       doc: "A load statement to apply to the query"
@@ -948,6 +955,7 @@ defmodule Ash.Query do
           |> set_authorize?(opts)
           |> set_tracer(opts)
           |> set_tenant(opts[:tenant] || query.tenant)
+          |> maybe_set_as_of(opts[:as_of] || query.as_of)
           |> cast_params(action, args, opts)
           |> set_argument_defaults(action)
           |> require_arguments(action)
@@ -2568,7 +2576,7 @@ defmodule Ash.Query do
         end
 
       value =
-        if argument do
+        if argument && !Ash.Expr.expr?(value) do
           Ash.Type.Helpers.handle_indexed_maps(argument.type, value)
         else
           value
@@ -2656,46 +2664,46 @@ defmodule Ash.Query do
           with {:ok, casted} <- Ash.Type.cast_input(argument.type, value, argument.constraints),
                {:ok, casted} <-
                  Ash.Type.apply_constraints(argument.type, casted, argument.constraints) do
-            if has_one_expr? do
-              {:cont,
-               {:ok,
-                Map.put(
-                  arg_values,
-                  argument.name,
-                  %Ash.Query.Function.Type{
-                    arguments: [value, argument.type, argument.constraints]
-                  }
-                )}}
-            else
-              cond do
-                is_nil(casted) && argument.allow_nil? ->
-                  {:cont, {:ok, Map.put(arg_values, argument.name, nil)}}
+            cond do
+              is_nil(casted) && argument.allow_nil? ->
+                {:cont, {:ok, Map.put(arg_values, argument.name, nil)}}
 
-                is_nil(casted) && is_nil(argument.default) ->
-                  {:halt,
-                   {:error,
-                    InvalidCalculationArgument.exception(
-                      field: argument.name,
-                      calculation: calculation.name,
-                      message: "is required",
-                      value: value
-                    )}}
+              is_nil(casted) ->
+                {:halt,
+                 {:error,
+                  InvalidCalculationArgument.exception(
+                    field: argument.name,
+                    calculation: calculation.name,
+                    message: "is required",
+                    value: value
+                  )}}
 
-                is_nil(Map.get(args, argument.name, Map.get(args, to_string(argument.name)))) &&
-                    not is_nil(value) ->
-                  {:cont,
-                   {:ok,
-                    Map.put(
-                      arg_values,
-                      argument.name,
-                      value
-                    )}}
+              has_one_expr? ->
+                {:cont,
+                 {:ok,
+                  Map.put(
+                    arg_values,
+                    argument.name,
+                    %Ash.Query.Function.Type{
+                      arguments: [casted, argument.type, argument.constraints],
+                      extra: %{casted?: true}
+                    }
+                  )}}
 
-                true ->
-                  {:cont, {:ok, Map.put(arg_values, argument.name, casted)}}
-              end
+              true ->
+                {:cont, {:ok, Map.put(arg_values, argument.name, casted)}}
             end
           else
+            :error ->
+              {:halt,
+               {:error,
+                InvalidCalculationArgument.exception(
+                  field: argument.name,
+                  calculation: calculation.name,
+                  message: "is invalid",
+                  value: value
+                )}}
+
             {:error, error} when is_binary(error) ->
               {:halt,
                {:error,
@@ -2825,14 +2833,24 @@ defmodule Ash.Query do
   def set_context(query, map) do
     query = new(query)
 
-    %{
+    query = %{
       query
       | context:
           query.context
           |> Ash.Helpers.deep_merge_maps(map)
           |> then(&Ash.Helpers.deep_merge_maps(&1, map[:shared] || %{}))
     }
+
+    # `as_of` rides in the shared context so it propagates to related queries
+    # (the same channel multitenancy uses), and is mirrored onto the struct
+    # field here so it is threaded to the data layer.
+    case Map.fetch(query.context, :as_of) do
+      {:ok, as_of} -> put_as_of(query, as_of)
+      :error -> query
+    end
   end
+
+  defp put_as_of(query, as_of), do: %{query | as_of: as_of}
 
   @doc """
   Gets the value of an argument provided to the query.
@@ -3088,6 +3106,29 @@ defmodule Ash.Query do
     query = new(query)
     %{query | tenant: tenant, to_tenant: Ash.ToTenant.to_tenant(tenant, query.resource)}
   end
+
+  @doc """
+  Pins the query to a point in time, for time-travel reads of temporal resources.
+
+  Any `now/0`, `ago/2` and `from_now/2` expressions in the query are anchored to
+  this instant, and (for temporal resources) only rows valid at this instant are
+  returned. Accepts a `DateTime`, the atom `:now` (resolved to the current time at
+  execution — equivalent to no time-travel), or `nil`. Defaults to "now" when unset.
+
+  See the `temporal` section of `Ash.Resource.Dsl`.
+  """
+  @spec as_of(t() | Ash.Resource.t(), DateTime.t() | :now | nil) :: t()
+  def as_of(query, nil), do: new(query)
+
+  def as_of(query, as_of) do
+    query
+    |> new()
+    |> set_context(%{shared: %{as_of: as_of}})
+  end
+
+  # Apply an `as_of` from opts without clobbering an unset query when there is none.
+  defp maybe_set_as_of(query, nil), do: query
+  defp maybe_set_as_of(query, value), do: as_of(query, value)
 
   @doc """
   Sets the pagination options of the query.
@@ -3490,7 +3531,7 @@ defmodule Ash.Query do
     {related, actual_relationship, opts_with_resource, is_unrelated?} =
       case relationship do
         [module] when is_atom(module) ->
-          if function_exported?(module, :__info__, 1) do
+          if Ash.Resource.Info.resource?(module) do
             {module, [], Keyword.put(opts, :resource, module), true}
           else
             related = Ash.Resource.Info.related(query.resource, relationship)
@@ -3602,6 +3643,13 @@ defmodule Ash.Query do
       ...>   {MyApp.Calculations.Discount, []}, %{rate: 0.1},
       ...>   [precision: 2, scale: 2], %{currency: "USD"})
       %Ash.Query{calculations: %{discounted_price: %{...}}, ...}
+
+      # Only see related data that the actor can read
+      iex> Ash.Query.calculate(MyApp.Post, :author_name, :string,
+      ...>   expr(author.name), %{}, [], %{}, authorize?: true)
+      %Ash.Query{calculations: %{author_name: %{...}}, ...}
+
+  The last argument is passed to `Ash.Query.Calculation.new/6` as options.
 
   ## See also
 
@@ -4389,7 +4437,7 @@ defmodule Ash.Query do
   - `filter/2` for adding filter conditions
   """
   @spec apply_to(t(), records :: list(Ash.Resource.Record.t()), opts :: Keyword.t()) ::
-          {:ok, list(Ash.Resource.Record.t())}
+          {:ok, list(Ash.Resource.Record.t())} | {:error, Ash.Error.t()}
   def apply_to(query, records, opts \\ []) do
     domain =
       query.domain || Ash.Resource.Info.domain(query.resource) || opts[:domain] ||
@@ -4508,6 +4556,7 @@ defmodule Ash.Query do
       |> Map.put(:action, ash_query.action)
       |> Map.put_new(:private, %{})
       |> put_in([:private, :tenant], ash_query.tenant)
+      |> put_in([:private, :as_of], Ash.Temporal.resolve_read_as_of(ash_query.as_of))
       |> Map.put_new(:data_layer, %{})
 
     context =
@@ -4538,6 +4587,7 @@ defmodule Ash.Query do
              )
            ),
          {:ok, query} <- add_tenant(query, ash_query),
+         {:ok, query} <- add_as_of(query, ash_query),
          {:ok, query} <-
            Ash.DataLayer.select(query, ash_query.select, ash_query.resource),
          {:ok, query} <- Ash.DataLayer.sort(query, ash_query.sort, resource),
@@ -4600,8 +4650,10 @@ defmodule Ash.Query do
                  combination_of_queries?: true,
                  combination_fieldset:
                    Enum.uniq(
-                     selected_fields(ash_query.resource, combination.select || default_select) ++
-                       Map.keys(combination.calculations)
+                     selected_fields(
+                       ash_query.resource,
+                       combination.select || default_select
+                     ) ++ Map.keys(combination.calculations)
                    )
                }}
             end
@@ -4691,6 +4743,20 @@ defmodule Ash.Query do
     with :context <- Ash.Resource.Info.multitenancy_strategy(ash_query.resource),
          tenant when not is_nil(tenant) <- ash_query.to_tenant,
          {:ok, query} <- Ash.DataLayer.set_tenant(ash_query.resource, query, ash_query.to_tenant) do
+      {:ok, query}
+    else
+      {:error, error} -> {:error, error}
+      _ -> {:ok, query}
+    end
+  end
+
+  defp add_as_of(query, ash_query) do
+    # `ash_query.as_of` is already a concrete `DateTime` (or nil) — frozen once upstream
+    # (see `Ash.Query.freeze_as_of/1`), so this never re-evaluates "now".
+    with as_of when not is_nil(as_of) <- ash_query.as_of,
+         :context <- Ash.Resource.Info.temporal_strategy(ash_query.resource),
+         true <- Ash.DataLayer.can?(:temporal, ash_query.resource),
+         {:ok, query} <- Ash.DataLayer.set_as_of(ash_query.resource, query, as_of) do
       {:ok, query}
     else
       {:error, error} -> {:error, error}

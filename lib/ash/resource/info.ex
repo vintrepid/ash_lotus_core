@@ -421,7 +421,7 @@ defmodule Ash.Resource.Info do
       when is_binary(relationship_name) or is_atom(relationship_name) do
     case Extension.get_persisted(resource, :relationships_by_name) do
       value when is_map(value) ->
-        value[relationship_name]
+        fetch_by_name(value, relationship_name)
 
       nil ->
         resource
@@ -530,6 +530,81 @@ defmodule Ash.Resource.Info do
     Spark.Dsl.Extension.get_opt(resource, [:multitenancy], :template, nil)
   end
 
+  @doc "The temporal strategy for a resource, or `nil` if it is not temporal"
+  @spec temporal_strategy(Spark.Dsl.t() | Ash.Resource.t()) :: :context | nil
+  def temporal_strategy(resource) do
+    Spark.Dsl.Extension.get_opt(resource, [:temporal], :strategy, nil)
+  end
+
+  @doc "Whether or not the resource is temporal (keyed on the presence of a strategy)"
+  @spec temporal?(Spark.Dsl.t() | Ash.Resource.t()) :: boolean
+  def temporal?(resource) do
+    not is_nil(temporal_strategy(resource))
+  end
+
+  @doc "The single period (range) attribute for a temporal resource"
+  @spec temporal_attribute(Spark.Dsl.t() | Ash.Resource.t()) :: atom | nil
+  def temporal_attribute(resource) do
+    if temporal?(resource) do
+      Spark.Dsl.Extension.get_opt(resource, [:temporal], :attribute, :valid_at)
+    end
+  end
+
+  @doc "The attribute a temporal resource stamps with the time each version was written, if any"
+  @spec temporal_recorded_at(Spark.Dsl.t() | Ash.Resource.t()) :: atom | nil
+  def temporal_recorded_at(resource) do
+    if temporal?(resource) do
+      Spark.Dsl.Extension.get_opt(resource, [:temporal], :recorded_at, nil)
+    end
+  end
+
+  @doc "The period attribute of a temporal resource, carrying its type and constraints."
+  @spec temporal_period(Spark.Dsl.t() | Ash.Resource.t()) :: Ash.Resource.Attribute.t() | nil
+  def temporal_period(resource) do
+    if name = temporal_attribute(resource) do
+      attribute(resource, name)
+    end
+  end
+
+  @doc "The resolved type of a temporal resource's period bounds."
+  @spec temporal_inner_type(Spark.Dsl.t() | Ash.Resource.t()) :: Ash.Type.t() | nil
+  def temporal_inner_type(resource) do
+    case temporal_period(resource) do
+      %{constraints: constraints} -> constraints[:inner_type]
+      _ -> nil
+    end
+  end
+
+  @doc "The constraints on a temporal resource's period bounds."
+  @spec temporal_inner_constraints(Spark.Dsl.t() | Ash.Resource.t()) :: Keyword.t() | nil
+  def temporal_inner_constraints(resource) do
+    case temporal_period(resource) do
+      %{constraints: constraints} -> constraints[:inner_constraints] || []
+      _ -> nil
+    end
+  end
+
+  @doc "Returns the `Ash.Signals` modules for a resource"
+  @spec signals_out(Spark.Dsl.t() | Ash.Resource.t()) :: [Ash.Signals.t()]
+  def signals_out(resource) do
+    Extension.get_persisted(resource, :signals_out, [])
+  end
+
+  @doc "Returns the signal listeners of a resource"
+  @spec signal_listeners(Spark.Dsl.t() | Ash.Resource.t()) :: [Ash.Resource.SignalListener.t()]
+  def signal_listeners(resource) do
+    Extension.get_persisted(resource, :signal_listeners, [])
+  end
+
+  @doc "Returns the signal listener of a resource with the given name, or `nil`."
+  @spec signal_listener(Spark.Dsl.t() | Ash.Resource.t(), atom()) ::
+          Ash.Resource.SignalListener.t() | nil
+  def signal_listener(resource, name) do
+    resource
+    |> signal_listeners()
+    |> Enum.find(&(&1.name == name))
+  end
+
   @doc "Returns all pipelines of a resource"
   @spec pipelines(Spark.Dsl.t() | Ash.Resource.t()) :: list(Ash.Resource.Pipeline.t())
   def pipelines(resource) do
@@ -556,7 +631,7 @@ defmodule Ash.Resource.Info do
   def calculation(resource, name) when is_binary(name) or is_atom(name) do
     case Extension.get_persisted(resource, :calculations_by_name) do
       value when is_map(value) ->
-        value[name]
+        fetch_by_name(value, name)
 
       nil ->
         resource
@@ -744,8 +819,6 @@ defmodule Ash.Resource.Info do
   @spec action_input?(Ash.Resource.t(), action :: atom(), input :: atom() | String.t()) ::
           boolean()
   def action_input?(resource, action, input) do
-    # Extension.get_persisted(resource, {:action_inputs, action, input}) || false
-
     case Extension.get_persisted(resource, {:action_inputs, action}) do
       nil -> false
       map_set -> input in map_set
@@ -753,7 +826,7 @@ defmodule Ash.Resource.Info do
   end
 
   @doc "Returns the list of possible accepted keys by an action"
-  @spec action_inputs(Ash.Resource.t(), action :: atom()) ::
+  @spec action_inputs(Spark.Dsl.t() | Ash.Resource.t(), action :: atom()) ::
           MapSet.t()
   def action_inputs(resource, action) do
     Extension.get_persisted(resource, {:action_inputs, action}) || MapSet.new()
@@ -859,12 +932,27 @@ defmodule Ash.Resource.Info do
   def attribute(resource, name) when is_binary(name) or is_atom(name) do
     case Extension.get_persisted(resource, :attributes_by_name) do
       value when is_map(value) ->
-        value[name]
+        fetch_by_name(value, name)
 
       nil ->
         resource
         |> attributes()
         |> Enum.find(&(to_string(&1.name) == to_string(name)))
+    end
+  end
+
+  # The `*_by_name` maps hold each struct under its atom name, and map the string
+  # form of the name to the atom name.
+  defp fetch_by_name(by_name, name) do
+    case by_name do
+      %{^name => atom_name} when is_atom(atom_name) and not is_nil(atom_name) ->
+        Map.get(by_name, atom_name)
+
+      %{^name => value} ->
+        value
+
+      _ ->
+        nil
     end
   end
 

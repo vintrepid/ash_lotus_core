@@ -207,6 +207,34 @@ defmodule Ash.Test.Resource.AggregatesTest do
     end
   end
 
+  describe "Ash.Query.Aggregate.aggregate_type/2" do
+    test "returns an error when a nested aggregate's type cannot be resolved" do
+      # ETS does not support custom aggregates, so add one to Comment's DSL
+      # state directly. A custom aggregate has no field to derive a type from.
+      custom = %Aggregate{
+        name: :custom_likes,
+        kind: :custom,
+        type: :string,
+        constraints: [],
+        relationship_path: [:likes]
+      }
+
+      comment_dsl =
+        Spark.Dsl.Transformer.add_entity(Comment.spark_dsl_config(), [:aggregates], custom)
+
+      outer = %Aggregate{
+        name: :first_custom_likes,
+        kind: :first,
+        related?: false,
+        resource: comment_dsl,
+        relationship_path: [],
+        field: :custom_likes
+      }
+
+      assert {:error, _} = Ash.Query.Aggregate.aggregate_type(Like, outer)
+    end
+  end
+
   test "it can load aggregates on resources which require an explicit domain" do
     defmodule Leg do
       @moduledoc false
@@ -328,7 +356,7 @@ defmodule Ash.Test.Resource.AggregatesTest do
       end
 
       relationships do
-        belongs_to :post, MultitenantPost do
+        belongs_to :post, Ash.Test.Resource.AggregatesTest.MultitenantPost do
           public?(true)
         end
       end
@@ -796,6 +824,69 @@ defmodule Ash.Test.Resource.AggregatesTest do
         |> Ash.Query.load([:count_current_tenant])
         |> Ash.read!(action: :read_bypass)
       end
+    end
+
+    test "aggregates with multitenancy :bypass read across tenants in filters and sorts" do
+      titles = ["Bypass Mostly Elsewhere", "Bypass Local", "Bypass Only Elsewhere"]
+
+      [mostly_elsewhere, local, only_elsewhere] =
+        for title <- titles do
+          MultitenantPost
+          |> Ash.Changeset.for_create(:create, %{title: title}, tenant: "tenant1")
+          |> Ash.create!()
+        end
+
+      for {post, tenant} <- [
+            {mostly_elsewhere, "tenant1"},
+            {mostly_elsewhere, "tenant2"},
+            {mostly_elsewhere, "tenant2"},
+            {mostly_elsewhere, "tenant2"},
+            {local, "tenant1"},
+            {local, "tenant1"},
+            {only_elsewhere, "tenant2"}
+          ] do
+        MultitenantComment
+        |> Ash.Changeset.for_create(:create, %{post_id: post.id, status: "active"},
+          tenant: tenant
+        )
+        |> Ash.create!()
+      end
+
+      read_titles = fn query ->
+        query
+        |> Ash.Query.filter(title in ^titles)
+        |> Ash.read!(tenant: "tenant1")
+        |> Enum.map(& &1.title)
+      end
+
+      assert read_titles.(Ash.Query.filter(MultitenantPost, count_all_tenants > 3)) == [
+               "Bypass Mostly Elsewhere"
+             ]
+
+      assert read_titles.(
+               Ash.Query.filter(
+                 MultitenantPost,
+                 has_comments_all_tenants and not has_comments_current_tenant
+               )
+             ) == ["Bypass Only Elsewhere"]
+
+      assert MultitenantPost
+             |> Ash.Query.sort(count_all_tenants: :desc)
+             |> then(read_titles) == titles
+
+      assert MultitenantPost
+             |> Ash.Query.filter(title in ^titles)
+             |> Ash.Query.sort(count_all_tenants: :desc)
+             |> Ash.Query.load(:count_all_tenants)
+             |> Ash.read!(tenant: "tenant1")
+             |> Enum.map(& &1.count_all_tenants) == [4, 2, 1]
+
+      post_ids = Enum.map([mostly_elsewhere, local, only_elsewhere], & &1.id)
+
+      assert MultitenantComment
+             |> Ash.Query.filter(post_id in ^post_ids and post.count_all_tenants > 3)
+             |> Ash.read!(tenant: "tenant1")
+             |> Enum.map(& &1.post_id) == [mostly_elsewhere.id]
     end
 
     test "returns error when main resource uses context multitenancy with bypass aggregate" do

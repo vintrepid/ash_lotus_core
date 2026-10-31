@@ -66,47 +66,72 @@ defmodule Ash.Actions.Create.Bulk do
         if opts[:transaction] == :all &&
              Ash.DataLayer.data_layer_can?(resource, :transact) do
           notify? = opts[:notify?] && !Process.put(:ash_started_transaction?, true)
+          queued_notifications = Process.get(:ash_notifications)
 
-          Ash.DataLayer.transaction(
-            List.wrap(resource) ++ action.touches_resources,
-            fn ->
-              do_run(domain, resource, action, inputs, opts)
-            end,
-            opts[:timeout],
-            %{
-              type: :bulk_create,
-              metadata: %{
-                resource: resource,
-                action: action.name,
-                actor: opts[:actor]
+          try do
+            Ash.DataLayer.transaction(
+              List.wrap(resource) ++ action.touches_resources,
+              fn ->
+                do_run(domain, resource, action, inputs, opts)
+              end,
+              opts[:timeout],
+              %{
+                type: :bulk_create,
+                metadata: %{
+                  resource: resource,
+                  action: action.name,
+                  actor: opts[:actor]
+                },
+                tenant: opts[:tenant],
+                data_layer_context: opts[:data_layer_context] || %{}
               },
-              data_layer_context: opts[:data_layer_context] || %{}
-            },
-            rollback_on_error?: false
-          )
-          |> case do
-            {:ok, bulk_result} ->
-              bulk_result =
-                if notify? do
-                  %{
+              rollback_on_error?: false
+            )
+            |> case do
+              {:ok, bulk_result} ->
+                bulk_result =
+                  if notify? do
+                    notifications =
+                      (bulk_result.notifications || []) ++
+                        Ash.Actions.Helpers.take_queued_notifications()
+
+                    if opts[:return_notifications?] do
+                      %{bulk_result | notifications: notifications}
+                    else
+                      remaining_notifications = Ash.Notifier.notify(notifications)
+
+                      Ash.Actions.Helpers.warn_missed!(resource, action, %{
+                        resource_notifications: remaining_notifications
+                      })
+
+                      %{bulk_result | notifications: nil}
+                    end
+                  else
                     bulk_result
-                    | notifications:
-                        (bulk_result.notifications || []) ++
-                          (Process.delete(:ash_notifications) || [])
-                  }
-                else
-                  bulk_result
-                end
+                  end
 
-              handle_bulk_result(bulk_result, resource, action, opts)
+                handle_bulk_result(bulk_result, resource, action, opts)
 
-            {:error, error} ->
-              handle_bulk_result(
-                %Ash.BulkResult{errors: [error], status: :error},
-                resource,
-                action,
-                opts
-              )
+              {:error, error} ->
+                Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
+
+                handle_bulk_result(
+                  %Ash.BulkResult{errors: [error], status: :error},
+                  resource,
+                  action,
+                  opts
+                )
+            end
+          catch
+            kind, reason ->
+              if notify?,
+                do: Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
+
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          after
+            if notify? do
+              Process.delete(:ash_started_transaction?)
+            end
           end
         else
           domain
@@ -643,6 +668,7 @@ defmodule Ash.Actions.Create.Bulk do
       context = batch |> Enum.at(0) |> Kernel.||(%{}) |> Map.get(:context)
 
       notify? = opts[:notify?] && !Process.put(:ash_started_transaction?, true)
+      queued_notifications = Process.get(:ash_notifications)
 
       try do
         Ash.DataLayer.transaction(
@@ -671,6 +697,7 @@ defmodule Ash.Actions.Create.Bulk do
               action: action.name,
               actor: opts[:actor]
             },
+            tenant: opts[:tenant],
             data_layer_context: opts[:data_layer_context] || context
           },
           rollback_on_error?: false
@@ -704,6 +731,8 @@ defmodule Ash.Actions.Create.Bulk do
             end)
 
           {:error, error} ->
+            Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
+
             # Convert batch changesets to error tuples for after_transaction processing
             error_tagged_results =
               Enum.map(batch, fn changeset ->
@@ -734,11 +763,14 @@ defmodule Ash.Actions.Create.Bulk do
               end
             end)
         end
+      catch
+        kind, reason ->
+          if notify?, do: Ash.Actions.Helpers.restore_queued_notifications(queued_notifications)
+          :erlang.raise(kind, reason, __STACKTRACE__)
       after
         if notify? do
-          notifications = Process.get(:ash_notifications, [])
+          notifications = Ash.Actions.Helpers.take_queued_notifications()
           remaining_notifications = Ash.Notifier.notify(notifications)
-          Process.delete(:ash_notifications)
           Process.delete(:ash_started_transaction?)
 
           Ash.Actions.Helpers.warn_missed!(resource, action, %{
@@ -871,6 +903,7 @@ defmodule Ash.Actions.Create.Bulk do
       |> set_lazy_non_matching_defaults()
       |> set_lazy_matching_defaults(lazy_matching_default_values)
       |> set_tenant(action)
+      |> filter_upsert_by_tenant()
 
     case opts[:transform_changeset] do
       nil -> changeset
@@ -887,6 +920,14 @@ defmodule Ash.Actions.Create.Bulk do
         Ash.Changeset.set_context(changeset, %{
           shared: %{private: %{multitenancy: :bypass_all}}
         })
+    end
+  end
+
+  defp filter_upsert_by_tenant(changeset) do
+    if changeset.context.private[:upsert?] do
+      Ash.Changeset.filter(changeset, Ash.Actions.Helpers.upsert_tenant_filter(changeset))
+    else
+      changeset
     end
   end
 
@@ -940,7 +981,7 @@ defmodule Ash.Actions.Create.Bulk do
 
             notifications =
               if opts[:notify?] do
-                process_notifications = Process.delete(:ash_notifications) || []
+                process_notifications = Ash.Actions.Helpers.take_queued_notifications()
                 bulk_notifications = Process.delete({:bulk_notifications, ref}) || []
 
                 if opts[:return_notifications?] do
@@ -1055,7 +1096,7 @@ defmodule Ash.Actions.Create.Bulk do
   defp default(%{default: value}), do: value
 
   defp authorize(batch, opts) do
-    if opts[:authorize?] do
+    if opts[:authorize?] && Ash.Actions.Helpers.authorizers?(batch) do
       Enum.map(batch, fn changeset ->
         if changeset.valid? do
           case Ash.can(changeset, opts[:actor],
@@ -1165,8 +1206,7 @@ defmodule Ash.Actions.Create.Bulk do
           |> Ash.Changeset.handle_allow_nil_atomics(opts[:actor])
           |> Ash.Changeset.apply_atomic_constraints(opts[:actor])
 
-        new_notifications =
-          Ash.Actions.Helpers.Bulk.store_notification(ref, new_notifications, opts)
+        Ash.Actions.Helpers.Bulk.store_notification(ref, new_notifications, opts)
 
         {changeset, manage_notifications} =
           if changeset.valid? do
@@ -1178,7 +1218,7 @@ defmodule Ash.Actions.Create.Bulk do
                    tenant: opts[:tenant]
                  ) do
               {:error, error} ->
-                {Ash.Changeset.add_error(changeset, error), new_notifications}
+                {Ash.Changeset.add_error(changeset, error), []}
 
               {changeset, manage_instructions} ->
                 {changeset, _} =
@@ -1403,10 +1443,10 @@ defmodule Ash.Actions.Create.Bulk do
                              ]}
 
                           _ ->
-                            []
+                            {:ok, []}
                         end
                       else
-                        []
+                        {:ok, []}
                       end
 
                     {:ok, %{__metadata__: %{upsert_skipped: true}} = record} ->
@@ -1418,7 +1458,7 @@ defmodule Ash.Actions.Create.Bulk do
                            })
                          ]}
                       else
-                        []
+                        {:ok, []}
                       end
 
                     {:ok, result} ->
@@ -1454,31 +1494,24 @@ defmodule Ash.Actions.Create.Bulk do
                 Process.put({:any_success?, ref}, true)
               end
 
-              tagged_results
+              Enum.map(tagged_results, fn
+                {:ok, result, changeset} ->
+                  [result] = Ash.Actions.Helpers.stamp_record_metadata([result], resource, opts)
+                  {:ok, result, changeset}
+
+                other ->
+                  other
+              end)
 
             {:ok, result} ->
-              result =
-                if tenant = opts[:tenant] do
-                  Enum.map(result, fn record ->
-                    %{record | __metadata__: Map.put(record.__metadata__, :tenant, tenant)}
-                  end)
-                else
-                  result
-                end
+              result = Ash.Actions.Helpers.stamp_record_metadata(result, resource, opts)
 
               Ash.Actions.Helpers.select(result, %{resource: resource, select: action_select})
 
             {:partial_success, failed, results} ->
               Process.put({:any_success?, ref}, true)
 
-              results =
-                if tenant = opts[:tenant] do
-                  Enum.map(results, fn record ->
-                    %{record | __metadata__: Map.put(record.__metadata__, :tenant, tenant)}
-                  end)
-                else
-                  results
-                end
+              results = Ash.Actions.Helpers.stamp_record_metadata(results, resource, opts)
 
               selected_results =
                 Ash.Actions.Helpers.select(results, %{resource: resource, select: action_select})
@@ -1771,7 +1804,7 @@ defmodule Ash.Actions.Create.Bulk do
           {:ok, records} ->
             load_query =
               resource
-              |> Ash.Query.load(List.wrap(opts[:load]))
+              |> Ash.Query.load(List.wrap(opts[:load]), Keyword.take(opts, [:strict?]))
               |> Ash.Actions.Helpers.merge_notifier_calculations(
                 Ash.Notifier.notifier_calculation_query(resource, action)
               )
@@ -1886,94 +1919,12 @@ defmodule Ash.Actions.Create.Bulk do
               )
             else
               Enum.map(batch, fn changeset ->
-                cond do
-                  !module.has_validate?() ->
-                    Ash.Changeset.add_error(
-                      changeset,
-                      Ash.Error.Framework.CanNotBeAtomic.exception(
-                        resource: changeset.resource,
-                        change: module,
-                        reason: "Create actions cannot be made atomic"
-                      )
-                    )
-
-                  invalid =
-                      Enum.find(validation.where, fn {where_mod, _} ->
-                        !where_mod.has_validate?()
-                      end) ->
-                    {invalid_mod, _} = invalid
-
-                    Ash.Changeset.add_error(
-                      changeset,
-                      Ash.Error.Framework.CanNotBeAtomic.exception(
-                        resource: changeset.resource,
-                        change: invalid_mod,
-                        reason: "Create actions cannot be made atomic"
-                      )
-                    )
-
-                  validation.only_when_valid? && !changeset.valid? ->
-                    changeset
-
-                  Enum.all?(validation.where || [], fn {where_mod, where_opts} ->
-                    where_opts =
-                        templated_opts(
-                          where_opts,
-                          actor,
-                          changeset.to_tenant,
-                          changeset.arguments,
-                          changeset.context,
-                          changeset
-                        )
-
-                    {:ok, where_opts} = Ash.Resource.Validation.init(where_mod, where_opts)
-
-                    Ash.Resource.Validation.validate(
-                      where_mod,
-                      changeset,
-                      where_opts,
-                      struct(Ash.Resource.Validation.Context, context)
-                    ) == :ok
-                  end) ->
-                    opts =
-                      templated_opts(
-                        opts,
-                        actor,
-                        changeset.to_tenant,
-                        changeset.arguments,
-                        changeset.context,
-                        changeset
-                      )
-
-                    {:ok, opts} = Ash.Resource.Validation.init(module, opts)
-
-                    case Ash.Resource.Validation.validate(
-                           module,
-                           changeset,
-                           opts,
-                           struct(
-                             Ash.Resource.Validation.Context,
-                             Map.put(context, :message, validation.message)
-                           )
-                         ) do
-                      :ok ->
-                        changeset
-
-                      {:error, error} ->
-                        error = Ash.Error.to_ash_error(error)
-
-                        if validation.message do
-                          error =
-                            Ash.Error.override_validation_message(error, validation.message)
-
-                          Ash.Changeset.add_error(changeset, error)
-                        else
-                          Ash.Changeset.add_error(changeset, error)
-                        end
-                    end
-
-                  true ->
-                    changeset
+                if validation.before_action? do
+                  Ash.Changeset.before_action(changeset, fn changeset ->
+                    validate_changeset(changeset, validation, actor, context)
+                  end)
+                else
+                  validate_changeset(changeset, validation, actor, context)
                 end
               end)
             end
@@ -1998,7 +1949,13 @@ defmodule Ash.Actions.Create.Bulk do
                 end) ||
                 (module.has_batch_change?() &&
                    module.has_after_batch?() &&
-                   Ash.Resource.Change.batch_callbacks?(module, batch, change_opts, context))
+                   Ash.Actions.Update.Bulk.batch_callbacks_for_batch?(
+                     module,
+                     batch,
+                     change_opts,
+                     actor,
+                     context
+                   ))
 
             %{
               state
@@ -2060,7 +2017,13 @@ defmodule Ash.Actions.Create.Bulk do
                   end) ||
                   (module.has_batch_change?() &&
                      module.has_after_batch?() &&
-                     Ash.Resource.Change.batch_callbacks?(module, batch, change_opts, context))
+                     Ash.Actions.Update.Bulk.batch_callbacks_for_batch?(
+                       module,
+                       batch,
+                       change_opts,
+                       actor,
+                       context
+                     ))
 
               %{
                 state
@@ -2085,6 +2048,8 @@ defmodule Ash.Actions.Create.Bulk do
       {:templated, change_opts} ->
         cond do
           module.has_batch_change?() ->
+            {:ok, change_opts} = Ash.Resource.Change.init(module, change_opts)
+
             Ash.Resource.Change.batch_change(
               module,
               batch,
@@ -2195,5 +2160,97 @@ defmodule Ash.Actions.Create.Bulk do
           changeset
       end
     end)
+  end
+
+  defp validate_changeset(changeset, %{validation: {module, opts}} = validation, actor, context) do
+    cond do
+      !module.has_validate?() ->
+        Ash.Changeset.add_error(
+          changeset,
+          Ash.Error.Framework.CanNotBeAtomic.exception(
+            resource: changeset.resource,
+            change: module,
+            reason: "Create actions cannot be made atomic"
+          )
+        )
+
+      invalid =
+          Enum.find(validation.where, fn {where_mod, _} ->
+            !where_mod.has_validate?()
+          end) ->
+        {invalid_mod, _} = invalid
+
+        Ash.Changeset.add_error(
+          changeset,
+          Ash.Error.Framework.CanNotBeAtomic.exception(
+            resource: changeset.resource,
+            change: invalid_mod,
+            reason: "Create actions cannot be made atomic"
+          )
+        )
+
+      validation.only_when_valid? && !changeset.valid? ->
+        changeset
+
+      Enum.all?(validation.where || [], fn {where_mod, where_opts} ->
+        where_opts =
+            templated_opts(
+              where_opts,
+              actor,
+              changeset.to_tenant,
+              changeset.arguments,
+              changeset.context,
+              changeset
+            )
+
+        {:ok, where_opts} = Ash.Resource.Validation.init(where_mod, where_opts)
+
+        Ash.Resource.Validation.validate(
+          where_mod,
+          changeset,
+          where_opts,
+          struct(Ash.Resource.Validation.Context, context)
+        ) == :ok
+      end) ->
+        opts =
+          templated_opts(
+            opts,
+            actor,
+            changeset.to_tenant,
+            changeset.arguments,
+            changeset.context,
+            changeset
+          )
+
+        {:ok, opts} = Ash.Resource.Validation.init(module, opts)
+
+        case Ash.Resource.Validation.validate(
+               module,
+               changeset,
+               opts,
+               struct(
+                 Ash.Resource.Validation.Context,
+                 Map.put(context, :message, validation.message)
+               )
+             ) do
+          :ok ->
+            changeset
+
+          {:error, error} ->
+            error = Ash.Error.to_ash_error(error)
+
+            if validation.message do
+              error =
+                Ash.Error.override_validation_message(error, validation.message)
+
+              Ash.Changeset.add_error(changeset, error)
+            else
+              Ash.Changeset.add_error(changeset, error)
+            end
+        end
+
+      true ->
+        changeset
+    end
   end
 end

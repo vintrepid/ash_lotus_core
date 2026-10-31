@@ -6,6 +6,8 @@ defmodule Ash.Test.NotifierTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Ash.Test.Domain, as: Domain
 
   defmodule Notifier do
@@ -264,6 +266,180 @@ defmodule Ash.Test.NotifierTest do
     end
   end
 
+  defmodule TransactionalPost do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: Ash.DataLayer.Mnesia,
+      notifiers: [Notifier]
+
+    actions do
+      default_accept :*
+      defaults [:read, create: :*]
+
+      create :create_with_nested do
+        change fn changeset, _ ->
+          Ash.Changeset.after_action(changeset, fn _changeset, result ->
+            Ash.create!(__MODULE__, %{name: "inner"})
+
+            {:ok, result}
+          end)
+        end
+      end
+
+      create :create_then_fail do
+        change fn changeset, _ ->
+          Ash.Changeset.after_action(changeset, fn _changeset, _result ->
+            Ash.create!(__MODULE__, %{name: "inner"})
+
+            {:error, "boom"}
+          end)
+        end
+      end
+
+      read :read_and_create do
+        transaction? true
+
+        prepare fn query, _ ->
+          Ash.Query.before_action(query, fn query ->
+            Ash.create!(__MODULE__, %{name: "inner"})
+            query
+          end)
+        end
+      end
+
+      read :read_create_then_raise do
+        transaction? true
+
+        prepare fn query, _ ->
+          Ash.Query.after_action(query, fn _query, _results ->
+            Ash.create!(__MODULE__, %{name: "inner"})
+            raise "boom"
+          end)
+        end
+      end
+
+      action :generic_create_then_fail do
+        transaction? true
+
+        run fn _input, _ ->
+          Ash.create!(__MODULE__, %{name: "inner"})
+
+          {:error, "boom"}
+        end
+      end
+    end
+
+    attributes do
+      uuid_primary_key :id
+
+      attribute :name, :string do
+        public?(true)
+      end
+    end
+  end
+
+  defmodule ReraisingMnesia do
+    @moduledoc false
+    # Mnesia, except that a throw or exit out of a transaction rolls it back and is then
+    # re-raised as is, like DBConnection (and so AshPostgres) does, instead of becoming
+    # `{:error, _}`.
+    use Spark.Dsl.Extension, transformers: [], sections: []
+
+    @behaviour Ash.DataLayer
+
+    callbacks = Ash.DataLayer.behaviour_info(:callbacks)
+
+    for {name, arity} = function <- Ash.DataLayer.Mnesia.__info__(:functions),
+        function in callbacks,
+        name != :transaction do
+      args = Macro.generate_arguments(arity, __MODULE__)
+
+      @impl true
+      def unquote(name)(unquote_splicing(args)) do
+        Ash.DataLayer.Mnesia.unquote(name)(unquote_splicing(args))
+      end
+    end
+
+    @impl true
+    def transaction(resource, func, timeout, reason) do
+      result =
+        Ash.DataLayer.Mnesia.transaction(
+          resource,
+          fn ->
+            try do
+              func.()
+            catch
+              # `Ash.DataLayer.rollback/2` and Mnesia's own aborts
+              :exit, {:aborted, _} = abort ->
+                exit(abort)
+
+              kind, value when kind in [:throw, :exit] ->
+                Process.put({__MODULE__, :escaped}, {kind, value, __STACKTRACE__})
+                :mnesia.abort(:escaped)
+            end
+          end,
+          timeout,
+          reason
+        )
+
+      case Process.delete({__MODULE__, :escaped}) do
+        nil -> result
+        {kind, value, stacktrace} -> :erlang.raise(kind, value, stacktrace)
+      end
+    end
+  end
+
+  defmodule ThrowingPost do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: ReraisingMnesia,
+      notifiers: [Notifier]
+
+    actions do
+      default_accept :*
+      defaults [:read, create: :*]
+
+      create :create_then_throw do
+        change fn changeset, _ ->
+          Ash.Changeset.after_action(changeset, fn _changeset, _result ->
+            Ash.create!(__MODULE__, %{name: "inner"})
+            throw(:boom)
+          end)
+        end
+      end
+
+      read :read_create_then_throw do
+        transaction? true
+
+        prepare fn query, _ ->
+          Ash.Query.after_action(query, fn _query, _results ->
+            Ash.create!(__MODULE__, %{name: "inner"})
+            throw(:boom)
+          end)
+        end
+      end
+
+      action :generic_create_then_throw do
+        transaction? true
+
+        run fn _input, _ ->
+          Ash.create!(__MODULE__, %{name: "inner"})
+          throw(:boom)
+        end
+      end
+    end
+
+    attributes do
+      uuid_primary_key :id
+
+      attribute :name, :string do
+        public?(true)
+      end
+    end
+  end
+
   setup do
     Application.put_env(Notifier, :notifier_test_pid, self())
     Application.put_env(Notifier2, :notifier_test_pid, self())
@@ -319,6 +495,147 @@ defmodule Ash.Test.NotifierTest do
              }
            ]
          }}
+      end)
+      |> Ash.create!()
+
+      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{custom?: true}}}
+    end
+
+    test "a custom notification without an action does not crash when telemetry handlers are attached" do
+      handler_id = {__MODULE__, :notifier_telemetry, System.unique_integer()}
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:ash, :notifier, :start],
+        fn _event, _measurements, metadata, _config ->
+          send(test_pid, {:telemetry_metadata, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      Comment
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.Changeset.before_action(fn changeset ->
+        {changeset,
+         %{
+           notifications: [
+             %Ash.Notifier.Notification{
+               resource: changeset.resource,
+               domain: Ash.Resource.Info.domain(changeset.resource),
+               metadata: %{custom?: true}
+             }
+           ]
+         }}
+      end)
+      |> Ash.create!()
+
+      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{custom?: true}}}
+      assert_receive {:telemetry_metadata, %{action: nil, resource: Comment}}
+    end
+
+    test "a custom notification can be returned as a bare list from an after_action hook" do
+      Comment
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.Changeset.after_action(fn changeset, result ->
+        {:ok, result,
+         [
+           %Ash.Notifier.Notification{
+             resource: changeset.resource,
+             domain: Ash.Resource.Info.domain(changeset.resource),
+             metadata: %{custom?: true}
+           }
+         ]}
+      end)
+      |> Ash.create!()
+
+      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{custom?: true}}}
+    end
+
+    test "a custom notification can be returned as a map from an after_action hook" do
+      Comment
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.Changeset.after_action(fn changeset, result ->
+        {:ok, result,
+         %{
+           notifications: [
+             %Ash.Notifier.Notification{
+               resource: changeset.resource,
+               domain: Ash.Resource.Info.domain(changeset.resource),
+               metadata: %{custom?: true}
+             }
+           ]
+         }}
+      end)
+      |> Ash.create!()
+
+      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{custom?: true}}}
+    end
+
+    test "notifications from before and after action hooks are both delivered" do
+      Comment
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.Changeset.before_action(fn changeset ->
+        {changeset,
+         [
+           %Ash.Notifier.Notification{
+             resource: changeset.resource,
+             domain: Ash.Resource.Info.domain(changeset.resource),
+             metadata: %{phase: :before}
+           }
+         ]}
+      end)
+      |> Ash.Changeset.after_action(fn changeset, result ->
+        {:ok, result,
+         [
+           %Ash.Notifier.Notification{
+             resource: changeset.resource,
+             domain: Ash.Resource.Info.domain(changeset.resource),
+             metadata: %{phase: :after}
+           }
+         ]}
+      end)
+      |> Ash.create!()
+
+      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{phase: :before}}}
+      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{phase: :after}}}
+    end
+
+    test "all notifications returned from an after_action hook are delivered" do
+      Comment
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.Changeset.after_action(fn changeset, result ->
+        notifications =
+          for phase <- [:first, :second] do
+            %Ash.Notifier.Notification{
+              resource: changeset.resource,
+              domain: Ash.Resource.Info.domain(changeset.resource),
+              metadata: %{phase: phase}
+            }
+          end
+
+        {:ok, result, notifications}
+      end)
+      |> Ash.create!()
+
+      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{phase: :first}}}
+      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{phase: :second}}}
+    end
+
+    test "a custom notification can be returned as a bare list from a before_action hook" do
+      Comment
+      |> Ash.Changeset.for_create(:create, %{})
+      |> Ash.Changeset.before_action(fn changeset ->
+        {changeset,
+         [
+           %Ash.Notifier.Notification{
+             resource: changeset.resource,
+             domain: Ash.Resource.Info.domain(changeset.resource),
+             metadata: %{custom?: true}
+           }
+         ]}
       end)
       |> Ash.create!()
 
@@ -444,5 +761,192 @@ defmodule Ash.Test.NotifierTest do
 
       assert_receive {:notification, %{action: %{type: :destroy}, resource: PostLink}}
     end
+  end
+
+  describe "rolled back transactions" do
+    setup do
+      capture_log(fn ->
+        Ash.DataLayer.Mnesia.start(Domain, [TransactionalPost])
+      end)
+
+      on_exit(fn ->
+        capture_log(fn ->
+          :mnesia.stop()
+          :mnesia.delete_schema([node()])
+        end)
+      end)
+    end
+
+    test "notifications queued in a rolled back create are not sent by the next action" do
+      assert {:error, _} =
+               TransactionalPost
+               |> Ash.Changeset.for_create(:create_then_fail, %{name: "outer"})
+               |> Ash.create()
+
+      refute Process.get(:ash_notifications)
+
+      Ash.create!(TransactionalPost, %{name: "next"})
+
+      assert_receive {:notification, %{data: %TransactionalPost{name: "next"}}}
+      refute_received {:notification, %{data: %TransactionalPost{name: "inner"}}}
+      assert [%{name: "next"}] = Ash.read!(TransactionalPost)
+    end
+
+    test "notifications queued in a rolled back generic action are not sent by the next action" do
+      assert {:error, _} =
+               TransactionalPost
+               |> Ash.ActionInput.for_action(:generic_create_then_fail, %{})
+               |> Ash.run_action()
+
+      refute Process.get(:ash_notifications)
+
+      Ash.create!(TransactionalPost, %{name: "next"})
+
+      assert_receive {:notification, %{data: %TransactionalPost{name: "next"}}}
+      refute_received {:notification, %{data: %TransactionalPost{name: "inner"}}}
+      assert [%{name: "next"}] = Ash.read!(TransactionalPost)
+    end
+
+    test "notifications queued in a committed read transaction are sent when it completes" do
+      Ash.read!(TransactionalPost, action: :read_and_create)
+
+      assert_receive {:notification, %{data: %TransactionalPost{name: "inner"}}}
+      refute Process.get(:ash_notifications)
+      refute Process.get(:ash_started_transaction?)
+    end
+
+    test "notifications queued in a rolled back read are not sent by the next action" do
+      assert_raise Ash.Error.Unknown, fn ->
+        Ash.read!(TransactionalPost, action: :read_create_then_raise)
+      end
+
+      refute Process.get(:ash_notifications)
+
+      Ash.create!(TransactionalPost, %{name: "next"})
+
+      assert_receive {:notification, %{data: %TransactionalPost{name: "next"}}}
+      refute_received {:notification, %{data: %TransactionalPost{name: "inner"}}}
+      assert [%{name: "next"}] = Ash.read!(TransactionalPost)
+    end
+
+    test "`return_notifications?: true` returns notifications queued by nested actions" do
+      {:ok, _, notifications} =
+        TransactionalPost
+        |> Ash.Changeset.for_create(:create_with_nested, %{name: "outer"})
+        |> Ash.create(return_notifications?: true)
+
+      assert notifications |> Enum.map(& &1.data.name) |> Enum.sort() == ["inner", "outer"]
+      refute Process.get(:ash_notifications)
+      refute_received {:notification, _}
+    end
+
+    test "a bulk create with `transaction: :all` does not leave notifications queued for later" do
+      Ash.bulk_create!([%{name: "bulk"}], TransactionalPost, :create,
+        transaction: :all,
+        notify?: true
+      )
+
+      assert_receive {:notification, %{data: %TransactionalPost{name: "bulk"}}}
+      refute Process.get(:ash_started_transaction?)
+
+      Ash.create!(TransactionalPost, %{name: "next"})
+
+      assert_receive {:notification, %{data: %TransactionalPost{name: "next"}}}
+    end
+  end
+
+  describe "transactions ended by a throw or exit" do
+    setup do
+      capture_log(fn ->
+        Ash.DataLayer.Mnesia.start(Domain)
+        :mnesia.create_table(ThrowingPost, attributes: [:_pkey, :val])
+      end)
+
+      on_exit(fn ->
+        capture_log(fn ->
+          :mnesia.stop()
+          :mnesia.delete_schema([node()])
+        end)
+      end)
+    end
+
+    test "notifications queued in an `Ash.transaction` ended by a throw are not sent by the next action" do
+      assert :boom ==
+               catch_throw(
+                 Ash.transaction(ThrowingPost, fn ->
+                   Ash.create!(ThrowingPost, %{name: "inner"})
+                   throw(:boom)
+                 end)
+               )
+
+      assert_rolled_back_and_not_sent()
+    end
+
+    test "notifications queued in an `Ash.transaction` ended by an exit are not sent by the next action" do
+      assert :boom ==
+               catch_exit(
+                 Ash.transaction(ThrowingPost, fn ->
+                   Ash.create!(ThrowingPost, %{name: "inner"})
+                   exit(:boom)
+                 end)
+               )
+
+      assert_rolled_back_and_not_sent()
+    end
+
+    test "notifications queued in a create ended by a throw are not sent by the next action" do
+      assert :boom ==
+               catch_throw(
+                 ThrowingPost
+                 |> Ash.Changeset.for_create(:create_then_throw, %{name: "outer"})
+                 |> Ash.create()
+               )
+
+      assert_rolled_back_and_not_sent()
+    end
+
+    test "notifications queued in a generic action ended by a throw are not sent by the next action" do
+      assert :boom ==
+               catch_throw(
+                 ThrowingPost
+                 |> Ash.ActionInput.for_action(:generic_create_then_throw, %{})
+                 |> Ash.run_action()
+               )
+
+      assert_rolled_back_and_not_sent()
+    end
+
+    test "notifications queued in a read ended by a throw are not sent" do
+      assert :boom ==
+               catch_throw(Ash.read(ThrowingPost, action: :read_create_then_throw))
+
+      assert_rolled_back_and_not_sent()
+    end
+
+    test "notifications queued in a bulk create ended by a throw are not sent by the next action" do
+      assert :boom ==
+               catch_throw(
+                 Ash.bulk_create([%{name: "outer"}], ThrowingPost, :create_then_throw,
+                   transaction: :all,
+                   notify?: true
+                 )
+               )
+
+      assert_rolled_back_and_not_sent()
+    end
+  end
+
+  # Asserts, before any other Ash call, that the rows were rolled back, that nothing was sent and
+  # that nothing is left queued; then that the next action sends only its own notification.
+  defp assert_rolled_back_and_not_sent do
+    assert [] = :mnesia.dirty_all_keys(ThrowingPost)
+    refute_received {:notification, _}
+    refute Process.get(:ash_notifications)
+
+    Ash.create!(ThrowingPost, %{name: "next"})
+
+    assert_receive {:notification, %{data: %ThrowingPost{name: "next"}}}
+    refute_received {:notification, %{data: %ThrowingPost{name: "inner"}}}
+    assert [%{name: "next"}] = Ash.read!(ThrowingPost)
   end
 end

@@ -6,6 +6,7 @@ defmodule Ash.Test.Policy.ComplexTest do
   @doc false
   use ExUnit.Case, async: false
   require Ash.Query
+  require Ash.Expr
 
   alias Ash.Test.Support.PolicyComplex.{Bio, Comment, Post, User}
 
@@ -133,6 +134,23 @@ defmodule Ash.Test.Policy.ComplexTest do
                comments: [text: "comment by a friend of a friend on my post"]
              )
              |> Ash.read!(actor: me)
+
+    assert [] =
+             Post
+             |> Ash.Query.filter_input(
+               Ash.Expr.expr(
+                 exists(comments, text == "comment by a friend of a friend on my post")
+               )
+             )
+             |> Ash.read!(actor: me)
+  end
+
+  test "it properly scopes exists in filters", %{me: me, post_by_me: post_by_me} do
+    assert [post_by_me.id] ==
+             Post
+             |> Ash.Query.filter_input(Ash.Expr.expr(exists(comments, true)))
+             |> Ash.read!(actor: me)
+             |> Enum.map(& &1.id)
   end
 
   test "it properly scopes single loads", %{me: me} do
@@ -140,6 +158,7 @@ defmodule Ash.Test.Policy.ComplexTest do
              User
              |> Ash.Query.filter(best_friend.name == "me")
              |> Ash.Query.deselect(:private_email)
+             |> Ash.Query.load(:best_friend)
              |> Ash.read!(actor: me)
   end
 
@@ -156,6 +175,35 @@ defmodule Ash.Test.Policy.ComplexTest do
              |> Ash.Query.load(:forbidden_field_author)
              |> Ash.read!(actor: me)
              |> Enum.map(& &1.forbidden_field_author)
+  end
+
+  test "forbidden relationships preserve other loaded relationships", %{
+    me: me,
+    post_by_me: post
+  } do
+    load = [
+      comments: [],
+      forbidden_field_author: Ash.Query.for_read(User, :always_forbid)
+    ]
+
+    for load <- [load, Enum.reverse(load)] do
+      assert %Post{
+               comments: [_ | _],
+               forbidden_field_author: %Ash.ForbiddenField{}
+             } = Ash.load!(post, load, actor: me)
+    end
+  end
+
+  test "forbidden relationships fail without allowing forbidden fields", %{
+    me: me,
+    post_by_me: post
+  } do
+    load = [author: Ash.Query.for_read(User, :always_forbid)]
+
+    assert {:error, %Ash.Error.Forbidden{}} = Ash.load(post, load, actor: me)
+
+    assert {:error, %Ash.Error.Forbidden{}} =
+             Post |> Ash.Query.load(load) |> Ash.read(actor: me)
   end
 
   test "calculations containing aggregates authorize their aggregates", %{
@@ -287,5 +335,91 @@ defmodule Ash.Test.Policy.ComplexTest do
   test "calculations get context and actor", %{me: me, post_by_me: post} do
     assert [_] = Post.erasable!(actor: me, context: %{post_id: post.id})
     assert %{text: "[deleted]"} = Post.erase!(post, actor: me, context: %{post_id: post.id})
+  end
+
+  describe "count, exists and aggregate apply related policies like read" do
+    defp answers(query, actor) do
+      opts = [actor: actor, authorize?: true]
+
+      %{
+        read: query |> Ash.read!(opts) |> Enum.map(& &1.text) |> Enum.sort(),
+        count: Ash.count!(query, opts),
+        exists: Ash.exists?(query, opts),
+        aggregate_count: Ash.aggregate!(query, {:n, :count}, opts).n,
+        aggregate_list: query |> Ash.aggregate!({:t, :list, field: :text}, opts) |> Map.get(:t)
+      }
+    end
+
+    defp assert_consistent(answers, expected_texts) do
+      assert answers.read == expected_texts
+      assert answers.count == length(expected_texts)
+      assert answers.exists == (expected_texts != [])
+      assert answers.aggregate_count == length(expected_texts)
+      assert Enum.sort(answers.aggregate_list) == expected_texts
+    end
+
+    test "filter_input across a relationship", %{me: me} do
+      Post
+      |> Ash.Query.filter_input(comments: [text: "comment by a friend of a friend on my post"])
+      |> answers(me)
+      |> assert_consistent([])
+
+      Post
+      |> Ash.Query.filter_input(comments: [text: "comment by me on my own post"])
+      |> answers(me)
+      |> assert_consistent(["post by me"])
+    end
+
+    # `me` can see 2 of the 3 comments on their post.
+    test "filter_input on an aggregate", %{me: me} do
+      Post
+      |> Ash.Query.filter_input(count_of_comments: 3)
+      |> answers(me)
+      |> assert_consistent([])
+
+      Post
+      |> Ash.Query.filter_input(count_of_comments: 2)
+      |> answers(me)
+      |> assert_consistent(["post by me"])
+    end
+
+    test "filter on an aggregate", %{me: me} do
+      Post
+      |> Ash.Query.filter(count_of_comments == 3)
+      |> answers(me)
+      |> assert_consistent([])
+    end
+
+    test "filter_input on a calculation over an aggregate", %{me: me} do
+      Post
+      |> Ash.Query.filter_input(count_of_comments_calc: 3)
+      |> answers(me)
+      |> assert_consistent([])
+    end
+
+    test "sorting on an aggregate with a limit", %{
+      me: me,
+      a_friend_of_my_friend: a_friend_of_my_friend,
+      post_by_my_friend: post_by_my_friend
+    } do
+      # Comments `me` can't see, so that by hidden count my friend's post (4)
+      # outranks mine (3), while by visible count mine (2) outranks theirs (0).
+      for i <- 1..3 do
+        Comment.create!(post_by_my_friend.id, "hidden #{i}",
+          actor: a_friend_of_my_friend,
+          authorize?: false
+        )
+      end
+
+      query =
+        Post
+        |> Ash.Query.sort_input("-count_of_comments")
+        |> Ash.Query.limit(1)
+
+      opts = [actor: me, authorize?: true]
+
+      assert ["post by me"] = query |> Ash.read!(opts) |> Enum.map(& &1.text)
+      assert ["post by me"] = Ash.aggregate!(query, {:t, :list, field: :text}, opts).t
+    end
   end
 end

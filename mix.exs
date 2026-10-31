@@ -10,13 +10,13 @@ defmodule Ash.MixProject do
   A declarative, extensible framework for building Elixir applications.
   """
 
-  @version "3.33.1"
+  @version "3.37.2"
 
   def project do
     [
       app: :ash,
       version: @version,
-      elixir: "~> 1.11",
+      elixir: "~> 1.17",
       consolidate_protocols: Mix.env() == :prod,
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -53,6 +53,8 @@ defmodule Ash.MixProject do
          search_data: Spark.Docs.search_data_for(Ash.Resource.Dsl)},
         {"documentation/dsls/DSL-Ash.Domain.md",
          search_data: Spark.Docs.search_data_for(Ash.Domain.Dsl)},
+        {"documentation/dsls/DSL-Ash.Signals.md",
+         search_data: Spark.Docs.search_data_for(Ash.Signals.Dsl)},
         {"documentation/dsls/DSL-Ash.Notifier.PubSub.md",
          search_data: Spark.Docs.search_data_for(Ash.Notifier.PubSub)},
         {"documentation/dsls/DSL-Ash.Policy.Authorizer.md",
@@ -90,6 +92,7 @@ defmodule Ash.MixProject do
         "documentation/topics/resources/embedded-resources.md",
         "documentation/topics/resources/identities.md",
         "documentation/topics/resources/notifiers.md",
+        "documentation/topics/resources/signals.md",
         "documentation/topics/actions/actions.md",
         "documentation/topics/actions/read-actions.md",
         "documentation/topics/actions/create-actions.md",
@@ -105,6 +108,7 @@ defmodule Ash.MixProject do
         "documentation/topics/advanced/combination-queries.md",
         "documentation/topics/advanced/timeouts.md",
         "documentation/topics/advanced/multitenancy.md",
+        "documentation/topics/advanced/temporal-resources.md",
         "documentation/topics/advanced/writing-extensions.md",
         "documentation/topics/advanced/code-generation.md",
         "documentation/moved/upgrade.md",
@@ -204,6 +208,8 @@ defmodule Ash.MixProject do
         Resources: [
           Ash.Resource.Calculation,
           Ash.Resource.Calculation.Builtins,
+          Ash.Resource.Actions.Implementation,
+          Ash.Resource.Actions.Implementation.Builtins,
           Ash.CodeInterface,
           Ash.Notifier,
           Ash.Notifier.Notification,
@@ -212,7 +218,11 @@ defmodule Ash.MixProject do
           Ash.Resource.ManualUpdate,
           Ash.Resource.ManualDestroy,
           Ash.Resource.ManualRelationship,
-          Ash.Domain
+          Ash.Domain,
+          Ash.Signals,
+          Ash.Signals.Delivery,
+          Ash.Signals.Delivery.Context,
+          Ash.Signals.Delivery.Inline
         ],
         Queries: [
           Ash.Query,
@@ -249,6 +259,8 @@ defmodule Ash.MixProject do
         Introspection: [
           Ash.Domain.Info,
           Ash.Resource.Info,
+          Ash.Signals.Info,
+          Ash.Signals.Registry,
           Ash.Policy.Info,
           Ash.DataLayer.Ets.Info,
           Ash.DataLayer.Mnesia.Info,
@@ -258,12 +270,14 @@ defmodule Ash.MixProject do
         Visualizations: [
           Ash.Domain.Info.Diagram,
           Ash.Domain.Info.Livebook,
-          Ash.Policy.Chart.Mermaid
+          Ash.Policy.Chart.Mermaid,
+          Ash.Signals.Graph
         ],
         Testing: [
           Ash.Generator,
           Ash.Seed,
-          Ash.Test
+          Ash.Test,
+          Ash.Signals.Test
         ],
         Builtins: [
           ~r/Ash.Resource.Validation/,
@@ -287,6 +301,7 @@ defmodule Ash.MixProject do
           Ash.CiString,
           Ash.Vector,
           Ash.Union,
+          Ash.Range,
           Ash.UUID,
           Ash.UUIDv7,
           Ash.NotLoaded,
@@ -337,6 +352,10 @@ defmodule Ash.MixProject do
           ~r/Ash.Resource.Attribute/,
           ~r/Ash.Resource.Aggregate/,
           ~r/Ash.Resource.Actions/,
+          Ash.Resource.SignalSource,
+          Ash.Resource.SignalListener,
+          Ash.Signals.Signal,
+          Ash.Signals.Field,
           Ash.Mix.Tasks.Helpers,
           Ash.Policy.FieldPolicy,
           Ash.Policy.Policy,
@@ -365,7 +384,7 @@ defmodule Ash.MixProject do
         "Changelog" => "https://github.com/ash-project/ash/blob/main/CHANGELOG.md",
         "Discord" => "https://discord.gg/HTHRaaVPUc",
         "Website" => "https://ash-hq.org",
-        "Forum" => "https://elixirforum.com/c/elixir-framework-forums/ash-framework-forum",
+        "Forum" => "https://elixirforum.com/ash",
         "REUSE Compliance" => "https://api.reuse.software/info/github.com/ash-project/ash"
       }
     ]
@@ -382,7 +401,7 @@ defmodule Ash.MixProject do
     [
       {:usage_rules, "~> 1.2 and >= 1.2.8", only: [:dev]},
       # DSLs
-      {:spark, ">= 2.6.0"},
+      {:spark, "~> 2.7 and >= 2.7.6"},
       # Ash resources are backed by ecto scheams
       {:ecto, "~> 3.14 and >= 3.14.2"},
       # Used by the ETS data layer
@@ -442,9 +461,9 @@ defmodule Ash.MixProject do
       ],
       format: "format --migrate",
       "spark.formatter":
-        "spark.formatter --extensions Ash.Resource.Dsl,Ash.Domain.Dsl,Ash.TypedStruct.Dsl,Ash.DataLayer.Ets,Ash.DataLayer.Mnesia,Ash.Notifier.PubSub,Ash.Policy.Authorizer,Ash.Reactor",
+        "spark.formatter --extensions Ash.Resource.Dsl,Ash.Domain.Dsl,Ash.Signals.Dsl,Ash.TypedStruct.Dsl,Ash.DataLayer.Ets,Ash.DataLayer.Mnesia,Ash.Notifier.PubSub,Ash.Policy.Authorizer,Ash.Reactor",
       "spark.cheat_sheets":
-        "spark.cheat_sheets --extensions Ash.Resource.Dsl,Ash.Domain.Dsl,Ash.TypedStruct.Dsl,Ash.DataLayer.Ets,Ash.DataLayer.Mnesia,Ash.Notifier.PubSub,Ash.Policy.Authorizer,Ash.Reactor"
+        "spark.cheat_sheets --extensions Ash.Resource.Dsl,Ash.Domain.Dsl,Ash.Signals.Dsl,Ash.TypedStruct.Dsl,Ash.DataLayer.Ets,Ash.DataLayer.Mnesia,Ash.Notifier.PubSub,Ash.Policy.Authorizer,Ash.Reactor"
     ]
   end
 end

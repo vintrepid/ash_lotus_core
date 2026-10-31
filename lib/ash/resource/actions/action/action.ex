@@ -16,6 +16,7 @@ defmodule Ash.Resource.Actions.Action do
     skip_unknown_inputs: [],
     arguments: [],
     preparations: [],
+    emits: [],
     allow_nil?: false,
     transaction?: false,
     primary?: false,
@@ -41,6 +42,7 @@ defmodule Ash.Resource.Actions.Action do
           transaction?: boolean,
           public?: boolean,
           preparations: [Ash.Resource.Preparation.t()],
+          emits: [Ash.Resource.Actions.Emit.t()],
           skip_global_validations?: boolean,
           __spark_metadata__: Spark.Dsl.Entity.spark_meta()
         }
@@ -91,7 +93,7 @@ defmodule Ash.Resource.Actions.Action do
                        {:spark, Reactor}
                      ]},
                   doc: """
-                  Module may be an `Ash.Resource.Actions.Implementation` or `Reactor`.
+                  Module may be an `Ash.Resource.Actions.Implementation`. To run a `Reactor`, use `reactor(MyReactor)`. See `Ash.Resource.Actions.Implementation.Builtins.reactor/2`.
                   """
                 ],
                 error_handler: [

@@ -306,6 +306,8 @@ create :create do
 end
 ```
 
+Within a single pipeline, all `change` entities (or `prepare` entities, for read and generic actions) come before all `validate` entities, regardless of the order they are declared in the pipeline.
+
 When referencing multiple pipelines in a single `pipe_through`, their entities are appended in the order listed:
 
 ```elixir
@@ -592,6 +594,21 @@ graph TD
   - External system integrations
   - Webhook calls
 - **Transaction Context**: Outside transaction
+
+- **Custom notifications from hooks**: `before_action` and `after_action` hooks
+  may return custom notifications as a single notification, a list of
+  notifications, a map containing a `:notifications` key, or `nil`:
+
+```elixir
+  Ash.Changeset.after_action(changeset, fn changeset, result ->
+    notification = %Ash.Notifier.Notification{
+      resource: changeset.resource,
+      metadata: %{event: :created}
+    }
+
+    {:ok, result, [notification]}
+  end)
+```
 
 ##### 18. Return Result
 - **Success**: Returns data with metadata

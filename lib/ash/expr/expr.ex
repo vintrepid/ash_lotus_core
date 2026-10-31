@@ -11,7 +11,17 @@ defmodule Ash.Expr do
 
   @type t :: any
   @pass_through_funcs [:where, :or_where, :expr, :@]
-  @aggregate_kinds Ash.Query.Aggregate.kinds()
+  # Literals rather than `Ash.Query.Aggregate.kinds/0` and `Ash.Query.Operator.operator_symbols/0`,
+  # because calling those at compile time makes this module depend on theirs at compile time,
+  # and much of Ash depends on this module at compile time. Tests keep these in sync.
+  @aggregate_kinds [:count, :first, :sum, :list, :max, :min, :avg, :exists, :custom]
+  @operator_symbols [:==, :>=, :>, :in, :<=, :<, :!=, :&&, :||, :<>, :/, :-, :*, :+]
+
+  @doc false
+  def aggregate_kinds, do: @aggregate_kinds
+
+  @doc false
+  def operator_symbols, do: @operator_symbols
 
   @doc """
   Evaluate an expression. See `eval/2` for more.
@@ -215,6 +225,40 @@ defmodule Ash.Expr do
       )
       when is_list(opts) do
     walk_template(template, fn
+      # Anchor relative-time expressions to a temporal query/changeset's `as_of`
+      # (threaded via `context`). Idempotent with `add_calc_context_to_filter`'s
+      # rewrite — once replaced with a DateTime there is no `now()` left to map.
+      %{__struct__: Ash.Query.Function.Now} = now ->
+        fill_template_as_of(opts) || now
+
+      %{__struct__: Ash.Query.Function.Ago, arguments: [factor, interval]} = ago
+      when is_integer(factor) ->
+        case fill_template_as_of(opts) do
+          nil -> ago
+          as_of -> Ash.Query.Function.Ago.datetime_add(as_of, -factor, interval)
+        end
+
+      %{__struct__: Ash.Query.Function.FromNow, arguments: [factor, interval]} = from_now
+      when is_integer(factor) ->
+        case fill_template_as_of(opts) do
+          nil -> from_now
+          as_of -> Ash.Query.Function.Ago.datetime_add(as_of, factor, interval)
+        end
+
+      %{__struct__: Ash.Query.Function.Ago, arguments: [duration]} = ago
+      when is_struct(duration, Duration) ->
+        case fill_template_as_of(opts) do
+          nil -> ago
+          as_of -> Ash.Query.Function.Ago.datetime_add(as_of, Duration.negate(duration))
+        end
+
+      # A date rather than a datetime, so it anchors by taking the date of `as_of`.
+      %{__struct__: Ash.Query.Function.Today} = today ->
+        case fill_template_as_of(opts) do
+          nil -> today
+          as_of -> DateTime.to_date(as_of)
+        end
+
       {:_actor, :_primary_key} ->
         actor = opts[:actor]
 
@@ -291,6 +335,13 @@ defmodule Ash.Expr do
       context: context,
       changeset: changeset
     )
+  end
+
+  defp fill_template_as_of(opts) do
+    context = opts[:context] || %{}
+
+    (get_in(context, [:private, :as_of]) || get_in(context, [:shared, :as_of]))
+    |> Ash.Temporal.resolve_write_as_of()
   end
 
   @doc false
@@ -571,8 +622,6 @@ defmodule Ash.Expr do
   end
 
   def walk_template(value, mapper), do: mapper.(value)
-
-  @operator_symbols Ash.Query.Operator.operator_symbols() -- [:is_nil]
 
   @doc false
   def do_expr(expr, escape? \\ true)
@@ -1085,22 +1134,26 @@ defmodule Ash.Expr do
     """
   end
 
-  def do_expr({op, _, args}, escape?) when is_atom(op) and is_list(args) do
-    last_arg = List.last(args)
+  def do_expr({op, _, args} = expr, escape?) when is_atom(op) and is_list(args) do
+    if sigil?(expr) do
+      sigil(expr)
+    else
+      last_arg = List.last(args)
 
-    args =
-      if Keyword.keyword?(last_arg) && Keyword.has_key?(last_arg, :do) do
-        Enum.map(:lists.droplast(args), &do_expr(&1, false)) ++
-          [
-            Enum.map(last_arg, fn {key, arg_value} ->
-              {key, do_expr(arg_value, false)}
-            end)
-          ]
-      else
-        Enum.map(args, &do_expr(&1, false))
-      end
+      args =
+        if Keyword.keyword?(last_arg) && Keyword.has_key?(last_arg, :do) do
+          Enum.map(:lists.droplast(args), &do_expr(&1, false)) ++
+            [
+              Enum.map(last_arg, fn {key, arg_value} ->
+                {key, do_expr(arg_value, false)}
+              end)
+            ]
+        else
+          Enum.map(args, &do_expr(&1, false))
+        end
 
-    soft_escape(%Ash.Query.Call{name: op, args: args, operator?: false}, escape?)
+      soft_escape(%Ash.Query.Call{name: op, args: args, operator?: false}, escape?)
+    end
   end
 
   def do_expr({left, _, _}, escape?) when is_tuple(left), do: do_expr(left, escape?)
@@ -1172,7 +1225,11 @@ defmodule Ash.Expr do
           {[:any], [:any]}
       end
 
-    overloads = Ash.Query.Operator.operator_overloads(name) || %{}
+    overloads =
+      for {declarer, signatures} <- Ash.Query.Operator.operator_overloads_by_type(name),
+          {match_types, value} <- signatures do
+        {match_types, value, declarer}
+      end
 
     no_signatures? = types == :var_args || returns == :no_return || returns == :unknown
 
@@ -1201,18 +1258,23 @@ defmodule Ash.Expr do
     if no_signatures? do
       []
     else
-      {more_match_types, overload_cast_as_types, overload_returns} =
+      {more_match_types, overload_cast_as_types, overload_returns, overload_declarers} =
         overloads
-        |> Enum.reduce({[], [], []}, fn {match_types, value}, {match_acc, cast_acc, return_acc} ->
+        |> Enum.reduce({[], [], [], []}, fn {match_types, value, declarer},
+                                            {match_acc, cast_acc, return_acc, declarer_acc} ->
           case value do
             {cast_as_types, return_type} when is_list(cast_as_types) ->
-              {[match_types | match_acc], [cast_as_types | cast_acc], [return_type | return_acc]}
+              {[match_types | match_acc], [cast_as_types | cast_acc], [return_type | return_acc],
+               [declarer | declarer_acc]}
 
             return_type ->
-              {[match_types | match_acc], [nil | cast_acc], [return_type | return_acc]}
+              {[match_types | match_acc], [nil | cast_acc], [return_type | return_acc],
+               [declarer | declarer_acc]}
           end
         end)
-        |> then(fn {m, c, r} -> {Enum.reverse(m), Enum.reverse(c), Enum.reverse(r)} end)
+        |> then(fn {m, c, r, d} ->
+          {Enum.reverse(m), Enum.reverse(c), Enum.reverse(r), Enum.reverse(d)}
+        end)
 
       # Put overloads first so they have priority over built-in types like :same
       types = Enum.concat(more_match_types, types)
@@ -1225,10 +1287,14 @@ defmodule Ash.Expr do
 
       returns = Enum.concat(overload_returns, returns)
 
+      declarers = Enum.concat(overload_declarers, Stream.duplicate(nil, length(types)))
+
       returns =
         Enum.map(returns, fn
           {:array, any} when any in [:same, :any] -> {:array, any}
+          {type, any} when any in [:same, :any] -> {Ash.Type.get_type(type), any}
           any when any in [:same, :any] -> any
+          {:referenced_type, _via} = referenced -> referenced
           {type, constraints} -> get_type({type, constraints})
           type -> get_type({type, []})
         end)
@@ -1236,6 +1302,7 @@ defmodule Ash.Expr do
       normalize_types = fn types ->
         Enum.map(types, fn
           {:array, any} when any in [:same, :any] -> {:array, any}
+          {type, any} when any in [:same, :any] -> {Ash.Type.get_type(type), any}
           any when any in [:same, :any] -> any
           {type, constraints} -> get_type({type, constraints})
           type -> get_type({type, []})
@@ -1254,21 +1321,16 @@ defmodule Ash.Expr do
           types -> types
         end)
 
-      types
-      |> Enum.zip(cast_as_types_list)
-      |> Enum.zip(returns)
-      |> Enum.map(fn {{match_types, cast_as_types}, returns} ->
-        {match_types, cast_as_types, returns}
-      end)
+      [types, cast_as_types_list, returns, declarers]
+      |> Enum.zip()
     end
-    |> Enum.reject(fn {match_types, _, _} -> match_types == :any end)
-    |> Enum.filter(fn {match_types, _, _} ->
-      match_types == :same ||
-        length(match_types) == length(values)
+    |> Enum.reject(fn {match_types, _, _, _} -> match_types == :any end)
+    |> Enum.filter(fn {match_types, _, _, _} = overload ->
+      (match_types == :same || length(match_types) == length(values)) &&
+        overload_grounded?(overload, values, value_types)
     end)
-    |> Enum.with_index()
-    |> Enum.map(fn {{match_types, cast_as_types, returns}, signature_index} ->
-      is_overload? = signature_index < Enum.count(overloads)
+    |> Enum.map(fn {match_types, cast_as_types, returns, declarer} ->
+      is_overload? = not is_nil(declarer)
 
       # An overload that declares `cast_as_types` is forcibly converting
       # operands to a different type than they natively resolve to (e.g.
@@ -1399,6 +1461,52 @@ defmodule Ash.Expr do
                  )}
             end
 
+          {{{param_type, vague_type}, _value}, index}, acc
+          when is_atom(param_type) and param_type != :array and vague_type in [:any, :same] ->
+            adopt = fn parameter -> Ash.Type.with_type_parameter(param_type, [], parameter) end
+
+            adopt_later = fn acc ->
+              acc = Map.update!(acc, :types, &[nil | &1])
+              {:cont, Map.update!(acc, :must_adopt_basis, &[{index, adopt} | &1])}
+            end
+
+            with {:ok, value_type} <- elem(value_types, index),
+                 {^param_type, constraints} <- unwrap_new_type(value_type),
+                 {type, parameter_constraints} <-
+                   Ash.Type.type_parameter(param_type, constraints) do
+              case acc[:basis] do
+                nil ->
+                  if vague_type == :any do
+                    acc = Map.update!(acc, :types, &[{param_type, constraints} | &1])
+                    {:cont, Map.put(acc, :basis, {type, parameter_constraints})}
+                  else
+                    acc =
+                      acc
+                      |> Map.update!(:types, &[nil | &1])
+                      |> Map.put(:fallback_basis, {type, parameter_constraints})
+
+                    {:cont, Map.update!(acc, :must_adopt_basis, &[{index, adopt} | &1])}
+                  end
+
+                {^type, matched_constraints} ->
+                  {:cont, Map.update!(acc, :types, &[adopt.({type, matched_constraints}) | &1])}
+
+                _ ->
+                  {:halt, :error}
+              end
+            else
+              # The value is known to be some other type entirely.
+              {other, _constraints} when is_atom(other) and other != param_type ->
+                if Ash.Type.ash_type?(other) do
+                  {:halt, :error}
+                else
+                  adopt_later.(acc)
+                end
+
+              _ ->
+                adopt_later.(acc)
+            end
+
           {{{type, constraints}, value}, index}, acc ->
             determined_type = elem(value_types, index)
 
@@ -1506,7 +1614,7 @@ defmodule Ash.Expr do
           nil
 
         %{basis: nil, must_adopt_basis: [], types: types, last_resort?: last_resort?} ->
-          if returns not in [:same, :any, {:array, :same}, {:array, :any}] do
+          if not vague_return?(returns) do
             output_types =
               cast_as_types || Enum.reverse(types)
 
@@ -1531,6 +1639,9 @@ defmodule Ash.Expr do
               same when same in [{:array, :same}, {:array, :any}] ->
                 {type, constraints} = basis
                 {{:array, type}, items: constraints}
+
+              {:referenced_type, via} ->
+                referenced_type(basis, via)
 
               other ->
                 other
@@ -1566,6 +1677,41 @@ defmodule Ash.Expr do
           end)
 
         select_matches(types, length(values), values)
+    end
+  end
+
+  # An overload belongs to the type that declares it, and only applies once an operand is
+  # known to be of that type: a literal of it, or an expression that resolves to it.
+  # Otherwise it would claim operands of unknown type, so that with a money type
+  # declaring `[money, :decimal]`, `fragment("...") < 0` would compare as money.
+  defp overload_grounded?({_match_types, _cast_as_types, _returns, nil}, _values, _value_types),
+    do: true
+
+  defp overload_grounded?({match_types, _cast_as_types, _returns, declarer}, values, value_types) do
+    declarer = Ash.Type.get_type(declarer)
+
+    declarer_positions =
+      match_types
+      |> Enum.zip(values)
+      |> Enum.with_index()
+      |> Enum.filter(&match?({{{^declarer, _}, _value}, _index}, &1))
+
+    declarer_positions == [] or
+      Enum.any?(declarer_positions, fn {{{_, constraints}, value}, index} ->
+        case elem(value_types, index) do
+          {:ok, {^declarer, _}} -> true
+          _ -> !Ash.Expr.expr?(value) && matches_type?(declarer, value, constraints)
+        end
+      end)
+  end
+
+  defp unwrap_new_type({type, constraints}) do
+    type = Ash.Type.get_type(type)
+
+    if is_atom(type) && Ash.Type.NewType.new_type?(type) do
+      unwrap_new_type({type.subtype_of(), Ash.Type.NewType.constraints(type, constraints)})
+    else
+      {type, constraints}
     end
   end
 
@@ -1679,6 +1825,34 @@ defmodule Ash.Expr do
     end
   end
 
+  # A return spec that stands for a type only known once the arguments' is: the same
+  # type (`:same`/`:any`), a list of it, or a type it refers to.
+  defp vague_return?(returns) do
+    returns in [:same, :any, {:array, :same}, {:array, :any}] or
+      match?({:referenced_type, _}, returns)
+  end
+
+  # The type the basis type refers to under `via`, as `c:Ash.Type.referenced_types/1`
+  # describes it. `range_lower/1` returns the type of its range's bounds, say, which is
+  # only known from the range type's constraints.
+  defp referenced_type({type, constraints}, via) do
+    type = Ash.Type.get_type(type)
+
+    if Code.ensure_loaded?(type) and function_exported?(type, :referenced_types, 1) do
+      type
+      |> apply(:referenced_types, [constraints || []])
+      |> Enum.find_value(fn
+        {referenced, referenced_constraints, ^via} ->
+          get_type({referenced, referenced_constraints})
+
+        _ ->
+          nil
+      end)
+    end
+  end
+
+  defp referenced_type(_basis, _via), do: nil
+
   def determine_type(value) do
     case value do
       %{__struct__: Ash.Query.Function.Type, arguments: [_, type, constraints]} ->
@@ -1744,8 +1918,19 @@ defmodule Ash.Expr do
       %{__struct__: Ash.Query.Parent, expr: expr} ->
         determine_type(expr)
 
-      %{__struct__: Ash.Query.UpsertConflict, expr: expr} ->
-        determine_type(expr)
+      %{__struct__: Ash.Query.UpsertConflict, attribute: attribute, resource: resource}
+      when not is_nil(resource) ->
+        case Ash.Resource.Info.attribute(resource, attribute) do
+          %Ash.Resource.Attribute{} = attribute ->
+            determine_type(%Ash.Query.Ref{
+              attribute: attribute,
+              relationship_path: [],
+              resource: resource
+            })
+
+          nil ->
+            :error
+        end
 
       %{__struct__: Ash.Query.Function.GetPath, arguments: [left, path]} ->
         determine_get_path_type(left, path)
@@ -2037,6 +2222,22 @@ defmodule Ash.Expr do
 
   defp cond_condition([condition | rest]) do
     {:and, [], [condition, cond_condition(rest)]}
+  end
+
+  defp sigil?({op, _, [{:<<>>, _, parts}, mods]}) when is_list(parts) and is_list(mods) do
+    String.starts_with?(Atom.to_string(op), "sigil_")
+  end
+
+  defp sigil?(_), do: false
+
+  # A sigil without interpolation is a literal, so it is left to Elixir to expand.
+  defp sigil({_, _, [{:<<>>, _, parts}, _]} = expr) do
+    if Enum.all?(parts, &is_binary/1) do
+      expr
+    else
+      raise ArgumentError,
+            "sigils with interpolation are not supported in expressions, pin the value instead. Got: #{Macro.to_string(expr)}"
+    end
   end
 
   defp soft_escape(%_{} = val, _) do

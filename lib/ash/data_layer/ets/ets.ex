@@ -58,6 +58,7 @@ defmodule Ash.DataLayer.Ets do
       :filter,
       :limit,
       :tenant,
+      :as_of,
       :domain,
       :select,
       sort: [],
@@ -100,7 +101,8 @@ defmodule Ash.DataLayer.Ets do
         case GenServer.start(__MODULE__, {resource, table},
                name: Module.concat(table, TableManager)
              ) do
-          {:error, {:already_started, _pid}} ->
+          {:error, {:already_started, pid}} ->
+            await_init(pid)
             ETS.Set.wrap_existing(table)
 
           {:error, error} ->
@@ -110,6 +112,15 @@ defmodule Ash.DataLayer.Ets do
             ETS.Set.wrap_existing(table)
         end
       end
+    end
+
+    # A manager's name is registered before its init/1 creates the table, and a call is
+    # only answered once init/1 has returned. A manager that died answers nothing; the
+    # table lookup that follows then reports the table as missing.
+    defp await_init(pid) do
+      GenServer.call(pid, :wait)
+    catch
+      :exit, _ -> :ok
     end
 
     def init({resource, table}) do
@@ -202,7 +213,13 @@ defmodule Ash.DataLayer.Ets do
               :ok
 
             pid ->
+              # Wait for the manager to exit, so its table is gone by the time this returns
+              ref = Process.monitor(pid)
               Process.exit(pid, :shutdown)
+
+              receive do
+                {:DOWN, ^ref, :process, _, _} -> :ok
+              end
           end
       end
     end
@@ -217,6 +234,7 @@ defmodule Ash.DataLayer.Ets do
   def can?(_, :combine), do: true
   def can?(_, {:combine, _type}), do: true
   def can?(_, :composite_primary_key), do: true
+  def can?(_, :temporal), do: true
   def can?(_, :expression_calculation), do: true
   def can?(_, :expression_calculation_sort), do: true
   def can?(_, :multitenancy), do: true
@@ -324,6 +342,12 @@ defmodule Ash.DataLayer.Ets do
 
   @doc false
   @impl true
+  def set_as_of(_resource, query, as_of) do
+    {:ok, %{query | as_of: as_of}}
+  end
+
+  @doc false
+  @impl true
   def set_context(_resource, query, context) do
     {:ok, %{query | context: context}}
   end
@@ -390,8 +414,16 @@ defmodule Ash.DataLayer.Ets do
               {:ok, matches} ->
                 field = field || Enum.at(Ash.Resource.Info.primary_key(resource), 0)
 
-                value = aggregate_value(matches, kind, field, uniq?, include_nil?, default_value)
-                {:cont, {:ok, Map.put(acc, name, value)}}
+                case load_aggregate_field(matches, field, resource, domain, context) do
+                  {:ok, matches} ->
+                    value =
+                      aggregate_value(matches, kind, field, uniq?, include_nil?, default_value)
+
+                    {:cont, {:ok, Map.put(acc, name, value)}}
+
+                  {:error, error} ->
+                    {:halt, {:error, error}}
+                end
 
               {:error, error} ->
                 {:halt, {:error, error}}
@@ -407,6 +439,21 @@ defmodule Ash.DataLayer.Ets do
 
       other ->
         other
+    end
+  end
+
+  # Records come straight from the table, so calculation and aggregate fields
+  # have to be loaded before their values can be aggregated.
+  defp load_aggregate_field(records, field, resource, domain, context) do
+    if is_atom(field) and not is_nil(Ash.Resource.Info.attribute(resource, field)) do
+      {:ok, records}
+    else
+      Ash.load(records, field,
+        domain: domain,
+        tenant: context[:tenant],
+        actor: context[:actor],
+        authorize?: false
+      )
     end
   end
 
@@ -439,6 +486,7 @@ defmodule Ash.DataLayer.Ets do
 
     with {:ok, records} when records != [] <-
            get_records(resource, combination_of, parent, tenant),
+         records <- Ash.Filter.Runtime.as_of_matches(records, resource, query.as_of),
          %Query{
            filter: filter,
            offset: offset,
@@ -461,7 +509,11 @@ defmodule Ash.DataLayer.Ets do
              parent
            ),
          records <-
-           distinct_and_sort(records, sort, distinct, distinct_sort, maybe_not_distinct?, domain),
+           distinct_and_sort(records, sort, distinct, distinct_sort,
+             maybe_not_distinct?: maybe_not_distinct?,
+             domain: domain,
+             tenant: context[:private][:tenant]
+           ),
          records <- Enum.drop(records, offset || []),
          records <- do_limit(records, limit),
          {:ok, records} <-
@@ -483,43 +535,58 @@ defmodule Ash.DataLayer.Ets do
     end
   end
 
-  defp distinct_and_sort(records, sort, distinct, distinct_sort, maybe_not_distinct?, domain) do
+  defp distinct_and_sort(records, sort, distinct, distinct_sort, opts) do
+    opts = Keyword.put(opts, :rekey?, false)
+
     if distinct in [nil, []] do
-      Sort.runtime_sort(records, sort,
-        domain: domain,
-        maybe_not_distinct?: maybe_not_distinct?,
-        rekey?: false
-      )
+      Sort.runtime_sort(records, sort, opts)
     else
       if distinct_sort in [nil, []] do
-        Sort.runtime_sort(records, sort,
-          domain: domain,
-          maybe_not_distinct?: maybe_not_distinct?,
-          rekey?: false
-        )
-        |> Sort.runtime_distinct(distinct,
-          domain: domain,
-          maybe_not_distinct?: maybe_not_distinct?,
-          rekey?: false
-        )
+        records
+        |> Sort.runtime_sort(sort, opts)
+        |> Sort.runtime_distinct(distinct, opts)
       else
         records
-        |> Sort.runtime_sort(distinct_sort,
-          domain: domain,
-          maybe_not_distinct?: maybe_not_distinct?,
-          rekey?: false
-        )
-        |> Sort.runtime_distinct(distinct,
-          domain: domain,
-          maybe_not_distinct?: maybe_not_distinct?,
-          rekey?: false
-        )
-        |> Sort.runtime_sort(sort,
-          domain: domain,
-          maybe_not_distinct?: maybe_not_distinct?,
-          rekey?: false
-        )
+        |> Sort.runtime_sort(distinct_sort, opts)
+        |> Sort.runtime_distinct(distinct, opts)
+        |> Sort.runtime_sort(sort, opts)
       end
+    end
+  end
+
+  defp lateral_join_source(source_query, root_data, source_attribute, domain) do
+    query =
+      source_query.resource
+      |> Ash.Query.new()
+      |> Ash.Query.set_tenant(source_query.tenant)
+      |> Ash.Query.as_of(source_query.as_of)
+      |> Ash.Query.set_context(%{private: %{internal?: true}})
+      |> Ash.Query.set_domain(domain)
+
+    query =
+      case Ash.Resource.Info.primary_key(query.resource) do
+        [] ->
+          source_attributes = Enum.map(root_data, &Map.get(&1, source_attribute))
+
+          Ash.Query.filter(query, ^ref(source_attribute) in ^source_attributes)
+
+        [field] ->
+          source_attributes = Enum.map(root_data, &Map.get(&1, field))
+          Ash.Query.filter(query, ^ref(field) in ^source_attributes)
+
+        fields ->
+          filter = [
+            or:
+              Enum.map(root_data, fn record ->
+                [and: Map.take(record, fields) |> Map.to_list()]
+              end)
+          ]
+
+          Ash.Query.do_filter(query, filter)
+      end
+
+    with {:ok, data_layer_query} <- Ash.Query.data_layer_query(query) do
+      run_query(data_layer_query, query.resource)
     end
   end
 
@@ -538,39 +605,10 @@ defmodule Ash.DataLayer.Ets do
           {source_query, source_attribute, destination_attribute, relationship}
         ]
       ) do
-    source_query =
-      source_query
-      |> Ash.Query.unset(:load)
-      |> Ash.Query.unset(:page)
-      |> Ash.Query.set_context(%{private: %{internal?: true}})
-      |> Ash.Query.set_domain(query.domain)
-
     primary_key = Ash.Resource.Info.primary_key(source_query.resource)
 
-    source_query =
-      case primary_key do
-        [] ->
-          source_attributes = Enum.map(root_data, &Map.get(&1, source_attribute))
-
-          Ash.Query.filter(source_query, ^ref(source_attribute) in ^source_attributes)
-
-        [field] ->
-          source_attributes = Enum.map(root_data, &Map.get(&1, field))
-          Ash.Query.filter(source_query, ^ref(field) in ^source_attributes)
-
-        fields ->
-          filter = [
-            or:
-              Enum.map(root_data, fn record ->
-                [and: Map.take(record, fields) |> Map.to_list()]
-              end)
-          ]
-
-          Ash.Query.do_filter(source_query, filter)
-      end
-
     source_query
-    |> Ash.Actions.Read.unpaginated_read(nil, authorize?: false)
+    |> lateral_join_source(root_data, source_attribute, query.domain)
     |> case do
       {:error, error} ->
         {:error, error}
@@ -618,43 +656,15 @@ defmodule Ash.DataLayer.Ets do
   end
 
   def run_query_with_lateral_join(query, root_data, _destination_resource, [
-        {source_query, source_attribute, source_attribute_on_join_resource, relationship},
+        {source_query, source_attribute, source_attribute_on_join_resource,
+         %{type: :many_to_many} = relationship},
         {through_query, destination_attribute_on_join_resource, destination_attribute,
          _through_relationship}
       ]) do
-    source_query =
-      source_query
-      |> Ash.Query.unset(:load)
-      |> Ash.Query.unset(:page)
-      |> Ash.Query.set_context(%{private: %{internal?: true}})
-      |> Ash.Query.set_domain(query.domain)
-
     primary_key = Ash.Resource.Info.primary_key(source_query.resource)
 
-    source_query =
-      case primary_key do
-        [] ->
-          source_attributes = Enum.map(root_data, &Map.get(&1, source_attribute))
-
-          Ash.Query.filter(source_query, ^ref(source_attribute) in ^source_attributes)
-
-        [field] ->
-          source_attributes = Enum.map(root_data, &Map.get(&1, field))
-          Ash.Query.filter(source_query, ^ref(field) in ^source_attributes)
-
-        fields ->
-          filter = [
-            or:
-              Enum.map(root_data, fn record ->
-                [and: Map.take(record, fields) |> Map.to_list()]
-              end)
-          ]
-
-          Ash.Query.do_filter(source_query, filter)
-      end
-
     source_query
-    |> Ash.read(authorize?: false)
+    |> lateral_join_source(root_data, source_attribute, query.domain)
     |> case do
       {:error, error} ->
         {:error, error}
@@ -666,6 +676,7 @@ defmodule Ash.DataLayer.Ets do
         root_data
         |> Enum.reduce_while({:ok, []}, fn parent, {:ok, results} ->
           through_query
+          |> resolve_parent(parent)
           |> Ash.Query.filter(
             ^ref(source_attribute_on_join_resource) ==
               ^Map.get(parent, source_attribute)
@@ -726,6 +737,140 @@ defmodule Ash.DataLayer.Ets do
           end
         end)
     end
+  end
+
+  # A through path: each step after the first is read once per record it is reached from, so
+  # that `parent/1` in its query refers to that record.
+  def run_query_with_lateral_join(query, root_data, _destination_resource, [
+        {source_query, source_attribute, destination_attribute, relationship} | [_ | _] = rest
+      ]) do
+    primary_key = Ash.Resource.Info.primary_key(source_query.resource)
+
+    source_query
+    |> lateral_join_source(root_data, source_attribute, query.domain)
+    |> case do
+      {:error, error} ->
+        {:error, error}
+
+      {:ok, root_data} ->
+        Enum.reduce_while(root_data, {:ok, []}, fn parent, {:ok, results} ->
+          rest
+          |> follow_through_path(
+            [parent],
+            source_attribute,
+            destination_attribute,
+            query.domain
+          )
+          |> case do
+            {:ok, records, source_attribute, destination_attribute} ->
+              values =
+                records
+                |> Enum.map(&Map.get(&1, source_attribute))
+                |> Enum.reject(&is_nil/1)
+                |> Enum.uniq()
+
+              new_filter =
+                if is_nil(query.filter) do
+                  Ash.Filter.parse!(query.resource, [{destination_attribute, [in: values]}])
+                else
+                  Ash.Filter.add_to_filter!(query.filter, [{destination_attribute, [in: values]}])
+                end
+
+              case run_query(%{query | filter: new_filter}, relationship.source, parent) do
+                {:ok, new_results} ->
+                  new_results =
+                    Enum.map(
+                      new_results,
+                      &Map.put(&1, :__lateral_join_source__, Map.take(parent, primary_key))
+                    )
+
+                  {:cont, {:ok, new_results ++ results}}
+
+                {:error, error} ->
+                  {:halt, {:error, error}}
+              end
+
+            {:error, error} ->
+              {:halt, {:error, error}}
+          end
+        end)
+    end
+  end
+
+  defp follow_through_path([], records, source_attribute, destination_attribute, _domain) do
+    {:ok, records, source_attribute, destination_attribute}
+  end
+
+  defp follow_through_path(
+         [{through_query, next_source_attribute, next_destination_attribute, _} | rest],
+         records,
+         source_attribute,
+         destination_attribute,
+         domain
+       ) do
+    records
+    |> Enum.reduce_while({:ok, []}, fn record, {:ok, acc} ->
+      through_query
+      |> resolve_parent(record)
+      |> Ash.Query.filter(^ref(destination_attribute) == ^Map.get(record, source_attribute))
+      |> Ash.Query.set_context(%{private: %{internal?: true}})
+      |> Ash.Query.set_domain(domain)
+      |> Ash.read(authorize?: false)
+      |> case do
+        {:ok, through_data} -> {:cont, {:ok, through_data ++ acc}}
+        {:error, error} -> {:halt, {:error, error}}
+      end
+    end)
+    |> case do
+      {:ok, through_data} ->
+        primary_key = Ash.Resource.Info.primary_key(through_query.resource)
+
+        follow_through_path(
+          rest,
+          Enum.uniq_by(through_data, &Map.take(&1, primary_key)),
+          next_source_attribute,
+          next_destination_attribute,
+          domain
+        )
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  # Replaces `parent/1` expressions in the query's filter with their values for `parent`.
+  defp resolve_parent(%{filter: nil} = query, _parent), do: query
+
+  defp resolve_parent(query, parent) do
+    filter =
+      Ash.Filter.map(query.filter, fn
+        %Ash.Query.Parent{expr: expr} ->
+          case Ash.Expr.eval(expr,
+                 record: parent,
+                 resource: parent.__struct__,
+                 unknown_on_unknown_refs?: true
+               ) do
+            {:ok, value} ->
+              value
+
+            {:error, error} ->
+              throw({:resolve_parent_error, error})
+
+            :unknown ->
+              throw(
+                {:resolve_parent_error,
+                 "could not resolve a `parent/1` expression in a through relationship step"}
+              )
+          end
+
+        other ->
+          other
+      end)
+
+    %{query | filter: filter}
+  catch
+    {:resolve_parent_error, error} ->
+      Ash.Query.add_error(query, error)
   end
 
   def do_add_calculations(records, _resource, [], _domain), do: {:ok, records}
@@ -859,7 +1004,11 @@ defmodule Ash.DataLayer.Ets do
                        context[:actor]
                      ),
                    sorted <-
-                     Sort.runtime_sort(filtered, query.sort, domain: domain, rekey?: false) do
+                     Sort.runtime_sort(filtered, query.sort,
+                       domain: domain,
+                       tenant: context[:tenant],
+                       rekey?: false
+                     ) do
                 field = field || Enum.at(Ash.Resource.Info.primary_key(query.resource), 0)
 
                 value =
@@ -905,7 +1054,11 @@ defmodule Ash.DataLayer.Ets do
                      authorize?: context[:authorize?] || false
                    ) do
                 {:ok, results} ->
-                  value = Map.get(results, name) || default_value
+                  value =
+                    case Map.get(results, name) do
+                      nil -> default_value
+                      value -> value
+                    end
 
                   if load do
                     {:cont, {:ok, Map.put(record, load, value)}}
@@ -1536,6 +1689,7 @@ defmodule Ash.DataLayer.Ets do
       |> resource_to_query(changeset.domain)
       |> Map.put(:filter, query.filter)
       |> Map.put(:tenant, changeset.tenant)
+      |> Map.put(:as_of, upsert_instant(resource, changeset))
       |> run_query(resource)
       |> case do
         {:ok, []} ->
@@ -1560,13 +1714,13 @@ defmodule Ash.DataLayer.Ets do
             resource
             |> update(
               %{changeset | action_type: :update, filter: nil},
-              Map.take(result, pkey),
+              pkey_map(resource, result),
               from_bulk_create?
             )
             |> set_upsert_action(:update)
           else
             {:ok, []} ->
-              {:ok, Ash.Resource.put_metadata(result, :upsert_skipped, true)}
+              skipped_upsert(resource, changeset, result)
 
             {:error, reason} ->
               {:error, reason}
@@ -1575,6 +1729,29 @@ defmodule Ash.DataLayer.Ets do
         {:ok, _} ->
           {:error, "Multiple records matching keys"}
       end
+    end
+  end
+
+  @doc false
+  # The record an upsert skipped is only returned from the changeset's tenant: an upsert on the
+  # primary key or an `all_tenants?` identity can conflict with a record in another tenant
+  def skipped_upsert(resource, changeset, result) do
+    tenant_filter =
+      case Ash.Actions.Helpers.upsert_tenant_filter(changeset) do
+        nil -> nil
+        tenant_filter -> Ash.Filter.parse!(resource, tenant_filter)
+      end
+
+    case filter_matches([result], tenant_filter, changeset.domain, changeset.tenant, nil) do
+      {:ok, [result]} ->
+        {:ok, Ash.Resource.put_metadata(result, :upsert_skipped, true)}
+
+      {:ok, []} ->
+        {:error,
+         Ash.Error.Changes.StaleRecord.exception(resource: resource, filter: changeset.filter)}
+
+      {:error, error} ->
+        {:error, error}
     end
   end
 
@@ -1700,26 +1877,30 @@ defmodule Ash.DataLayer.Ets do
         other -> other
       end
     else
-      with {:ok, table} <- wrap_or_create_table(resource, options.tenant) do
-        Enum.reduce_while(stream, {:ok, []}, fn changeset, {:ok, results} ->
-          with {:ok, pkey} <- get_valid_pkey(resource, changeset),
+      with {:ok, table} <- wrap_or_create_table(resource, options.tenant),
+           {:ok, stored} <- stored_index(table, resource) do
+        Enum.reduce_while(stream, {:ok, [], stored}, fn changeset, {:ok, results, known} ->
+          with {:ok, valid_pkey} <- get_valid_pkey(resource, changeset),
                {:ok, record} <- Ash.Changeset.apply_attributes(changeset),
                {:ok, record} <- apply_atomics(changeset, resource, record),
-               record <- unload_relationships(resource, record) do
+               {:ok, record} <- establish_period(record, resource, changeset),
+               record <- unload_relationships(resource, record),
+               :ok <- check_non_empty(resource, record),
+               :ok <- check_non_overlapping(resource, record, known) do
             {:cont,
              {:ok,
               [
-                {pkey, changeset.context.bulk_create.index, changeset.context.bulk_create.ref,
-                 record}
+                {create_key(resource, record, valid_pkey), changeset.context.bulk_create.index,
+                 changeset.context.bulk_create.ref, record}
                 | results
-              ]}}
+              ], remember_period(known, resource, record)}}
           else
             {:error, error} ->
               {:halt, {:error, error}}
           end
         end)
         |> case do
-          {:ok, records} ->
+          {:ok, records, _known} ->
             case put_or_insert_new_batch(table, records, resource, options.return_records?) do
               :ok ->
                 :ok
@@ -1745,13 +1926,18 @@ defmodule Ash.DataLayer.Ets do
   @doc false
   @impl true
   def create(resource, changeset, from_bulk_create? \\ false) do
-    with {:ok, pkey} <- get_valid_pkey(resource, changeset),
+    with {:ok, valid_pkey} <- get_valid_pkey(resource, changeset),
          {:ok, table} <- wrap_or_create_table(resource, changeset.tenant),
          _ <- if(!from_bulk_create?, do: log_create(resource, changeset)),
          {:ok, record} <- Ash.Changeset.apply_attributes(changeset),
          {:ok, record} <- apply_atomics(changeset, resource, record),
+         {:ok, record} <- establish_period(record, resource, changeset),
          record <- unload_relationships(resource, record),
-         {:ok, record} <- put_or_insert_new(table, {pkey, record}, resource) do
+         :ok <- check_non_empty(resource, record),
+         {:ok, stored} <- stored_periods(table, resource, record),
+         :ok <- check_non_overlapping(resource, record, stored),
+         {:ok, record} <-
+           put_or_insert_new(table, {create_key(resource, record, valid_pkey), record}, resource) do
       {:ok, set_loaded(record)}
     else
       {:error, error} -> {:error, error}
@@ -1770,6 +1956,124 @@ defmodule Ash.DataLayer.Ets do
   end
 
   defp apply_atomics(_changeset, _resource, record), do: {:ok, record}
+
+  # The instant is this layer's: a core `now()` resolved earlier could precede the record.
+  defp establish_period(record, resource, changeset) do
+    case Ash.Resource.Info.temporal_attribute(resource) do
+      nil ->
+        {:ok, record}
+
+      attribute ->
+        {:ok,
+         put_established_period(
+           record,
+           attribute,
+           Map.get(record, attribute),
+           resource,
+           changeset
+         )}
+    end
+  end
+
+  defp check_non_empty(resource, record) do
+    with period when not is_nil(period) <- Ash.Resource.Info.temporal_attribute(resource),
+         %Ash.Range{} = value <- Map.get(record, period),
+         true <- Ash.Range.empty?(value) do
+      {:error,
+       Ash.Error.Changes.InvalidAttribute.exception(
+         field: period,
+         value: value,
+         message: "is empty, so the record could not be read at any point in time"
+       )}
+    else
+      _ -> :ok
+    end
+  end
+
+  # Not a lock: the look and the write are separate, so concurrent creates can both land.
+  defp check_non_overlapping(resource, record, known) do
+    with period when not is_nil(period) <- Ash.Resource.Info.temporal_attribute(resource),
+         %Ash.Range{} = period_value <- Map.get(record, period),
+         periods = Map.get(known, primary_key(resource, record), []),
+         true <- Enum.any?(periods, &overlapping?(&1, period_value)) do
+      {:error,
+       Ash.Error.Changes.InvalidAttribute.exception(
+         field: period,
+         value: period_value,
+         message: "overlaps the period of an existing version of this record"
+       )}
+    else
+      _ -> :ok
+    end
+  end
+
+  defp overlapping?(stored, period_value) do
+    match?(%Ash.Range{}, stored) and Ash.Range.intersects?(stored, period_value)
+  end
+
+  # A map pattern matches keys containing it, so only this record's versions are read.
+  defp stored_periods(table, resource, record) do
+    case Ash.Resource.Info.temporal_attribute(resource) do
+      nil ->
+        {:ok, %{}}
+
+      period ->
+        primary_key = primary_key(resource, record)
+
+        with {:ok, periods} <-
+               ETS.Set.select(table, [{{Map.put(primary_key, period, :"$1"), :_}, [], [:"$1"]}]) do
+          {:ok, %{primary_key => periods}}
+        end
+    end
+  end
+
+  # Nothing is written until the reduce ends, so one read covers the batch.
+  defp stored_index(table, resource) do
+    case Ash.Resource.Info.temporal_attribute(resource) do
+      nil ->
+        {:ok, %{}}
+
+      period ->
+        with {:ok, keys} <- ETS.Set.select(table, [{{:"$1", :_}, [], [:"$1"]}]) do
+          {:ok, Enum.group_by(keys, &Map.drop(&1, [period]), &Map.get(&1, period))}
+        end
+    end
+  end
+
+  # Versions earlier in the batch are not in the table yet.
+  defp remember_period(known, resource, record) do
+    case Ash.Resource.Info.temporal_attribute(resource) do
+      nil ->
+        known
+
+      period ->
+        value = Map.get(record, period)
+        Map.update(known, primary_key(resource, record), [value], &[value | &1])
+    end
+  end
+
+  defp primary_key(resource, record) do
+    Map.take(record, Ash.Resource.Info.primary_key(resource))
+  end
+
+  defp put_established_period(record, _attribute, %Ash.Range{}, _resource, _changeset), do: record
+
+  defp put_established_period(record, attribute, nil, resource, changeset) do
+    case Ash.Temporal.write_period(resource, changeset.as_of) do
+      {:ok, period} -> Map.put(record, attribute, period)
+      :error -> record
+    end
+  end
+
+  defp put_established_period(record, _attribute, _other, _resource, _changeset), do: record
+
+  # Without an instant the query sees every version, not the one holding it.
+  defp upsert_instant(resource, changeset) do
+    case Ash.Temporal.write_instant(resource, changeset.as_of) do
+      {:ok, instant} -> instant
+      :error -> nil
+    end
+  end
 
   defp set_loaded(%resource{} = record) do
     %{record | __meta__: %Ecto.Schema.Metadata{state: :loaded, schema: resource}}
@@ -1849,6 +2153,12 @@ defmodule Ash.DataLayer.Ets do
     end
   end
 
+  # Upstream's fix (v3.32.2): a resource with NO primary key gave every record
+  # the same empty key, so creates overwrote one another. The synthetic ref is
+  # per-record, so keyless records stop colliding.
+  #
+  # ⚠️ This validates and supplies a key; it does NOT decide the STORED key for
+  # a keyed resource - `create_key/3` does, because ours carries the period.
   defp get_valid_pkey(resource, changeset) do
     case Ash.Resource.Info.primary_key(resource) do
       [] ->
@@ -1865,6 +2175,17 @@ defmodule Ash.DataLayer.Ets do
         else
           {:ok, pkey}
         end
+    end
+  end
+
+  # The stored key. A keyed resource keys on the RECORD, not the changeset:
+  # `key_fields/1` appends the temporal attribute, and the period is only
+  # established once `establish_period/3` has run. A keyless resource has
+  # nothing to key on, so it takes the synthetic ref above.
+  defp create_key(resource, record, synthetic) do
+    case Ash.Resource.Info.primary_key(resource) do
+      [] -> synthetic
+      _ -> pkey_map(resource, record)
     end
   end
 
@@ -1914,6 +2235,7 @@ defmodule Ash.DataLayer.Ets do
     |> case do
       {:ok, results} ->
         results
+        |> once_per_record(resource, changeset)
         |> Enum.reduce_while(acc, fn result, acc ->
           result_changeset = %{changeset | data: result}
 
@@ -1944,6 +2266,18 @@ defmodule Ash.DataLayer.Ets do
     end
   end
 
+  defp once_per_record(results, resource, changeset) do
+    case changeset.as_of do
+      %Ash.Range{} = as_of ->
+        results
+        |> Enum.filter(&touches_portion?(resource, &1, as_of))
+        |> then(&first_versions(resource, &1))
+
+      _ ->
+        results
+    end
+  end
+
   @doc false
   @impl true
   def destroy(resource, %{data: record, filter: filter} = changeset) do
@@ -1953,14 +2287,16 @@ defmodule Ash.DataLayer.Ets do
       changeset.tenant,
       filter,
       changeset.domain,
-      changeset.context[:private][:actor]
+      changeset.context[:private][:actor],
+      supersession(resource, changeset),
+      match?(%Ash.Range{}, changeset.as_of)
     )
   end
 
-  defp do_destroy(resource, record, tenant, filter, domain, actor) do
+  defp do_destroy(resource, record, tenant, filter, domain, actor, supersede, range?) do
     case wrap_or_create_table(resource, tenant, false) do
       {:ok, table} ->
-        do_destroy(table, resource, record, tenant, filter, domain, actor)
+        do_destroy(table, resource, record, tenant, filter, domain, actor, supersede, range?)
 
       # Nothing has ever been written for this tenant, so there is nothing to destroy.
       :no_table ->
@@ -1975,17 +2311,15 @@ defmodule Ash.DataLayer.Ets do
     end
   end
 
-  defp do_destroy(table, resource, record, tenant, filter, domain, actor) do
-    pkey = Map.take(record, Ash.Resource.Info.primary_key(resource))
+  defp do_destroy(table, resource, record, tenant, filter, domain, actor, supersede, range?) do
+    pkey = holding_key(table, resource, record, supersede, range?)
 
     if has_filter?(filter) do
       case ETS.Set.get(table, pkey) do
         {:ok, {_key, record}} when is_map(record) ->
           with {:ok, record} <- cast_record(record, resource),
                {:ok, [_]} <- filter_matches([record], filter, domain, tenant, actor) do
-            with {:ok, _} <- ETS.Set.delete(table, pkey) do
-              :ok
-            end
+            retire(table, pkey, resource, record, supersede, range?)
           else
             {:ok, []} ->
               {:error,
@@ -1998,14 +2332,153 @@ defmodule Ash.DataLayer.Ets do
               {:error, error}
           end
 
+        {:ok, _} ->
+          {:error, Ash.Error.Changes.StaleRecord.exception(resource: resource, filter: filter)}
+
         {:error, error} ->
           {:error, error}
       end
     else
-      with {:ok, _} <- ETS.Set.delete(table, pkey) do
-        :ok
+      retire(table, pkey, resource, record, supersede, range?)
+    end
+  end
+
+  # A range reaches every version it overlaps. An instant closes only the version given.
+  defp retire(table, _pkey, resource, record, {period, %Ash.Range{} = written}, true) do
+    with {:ok, periods} <- stored_periods(table, resource, record) do
+      primary_key = primary_key(resource, record)
+
+      periods
+      |> Map.get(primary_key, [])
+      |> Enum.filter(&Ash.Range.intersects?(&1, written))
+      |> case do
+        [] -> {:error, Ash.Error.Changes.StaleRecord.exception(resource: resource, field: period)}
+        versions -> close_versions(table, resource, primary_key, period, versions, written)
       end
     end
+  end
+
+  defp retire(table, pkey, resource, _record, supersede, _range?),
+    do: retire(table, pkey, resource, supersede)
+
+  defp retire(table, pkey, resource, supersede) do
+    case {supersede, ETS.Set.get(table, pkey)} do
+      {{period, %Ash.Range{} = written}, {:ok, {_key, stored}}} when is_map(stored) ->
+        close_version(table, pkey, stored, resource, period, written)
+
+      # No version holds the instant, so there is none for it to end.
+      {{period, %Ash.Range{}}, {:ok, _}} ->
+        {:error, Ash.Error.Changes.StaleRecord.exception(resource: resource, field: period)}
+
+      _ ->
+        with {:ok, _} <- ETS.Set.delete(table, pkey), do: :ok
+    end
+  end
+
+  defp close_versions(table, resource, primary_key, period, versions, written) do
+    Enum.reduce_while(versions, :ok, fn version, :ok ->
+      key = Map.put(primary_key, period, version)
+
+      with {:ok, {_key, stored}} <- ETS.Set.get(table, key),
+           :ok <- close_version(table, key, stored, resource, period, overlap(version, written)) do
+        {:cont, :ok}
+      else
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  # A destroy ends validity over the period it names. Closing a version at the instant it
+  # began leaves nothing to keep, so it goes.
+  defp close_version(table, pkey, stored, resource, period, written) do
+    prior = Map.get(pkey, period)
+
+    with {:ok, closed} <- close_at(prior, written.lower, resource, period),
+         {:ok, resumed} <- resume_after(prior, written, resource, period),
+         {:ok, versions} <- carved(resource, pkey, period, stored, [closed, resumed]),
+         {:ok, table} <- ETS.Set.delete(table, pkey),
+         {:ok, _} <- put_versions(table, versions) do
+      :ok
+    end
+  end
+
+  defp put_versions(table, []), do: {:ok, table}
+  defp put_versions(table, versions), do: ETS.Set.put(table, versions)
+
+  # An instant ends validity for good; a range hands back what lies beyond its upper bound.
+  defp resume_after(_prior, %Ash.Range{upper: nil}, _resource, _period), do: {:ok, nil}
+
+  defp resume_after(%Ash.Range{} = prior, %Ash.Range{} = written, resource, period) do
+    resumed = %{
+      prior
+      | lower: written.upper,
+        bounds: bounds(not Ash.Range.upper_inclusive?(written.bounds), prior.bounds)
+    }
+
+    cond do
+      not Ash.Range.contains?(prior, written) ->
+        {:error,
+         Ash.Error.Changes.PeriodOutOfBounds.exception(
+           resource: resource,
+           field: period,
+           period: written,
+           within: prior
+         )}
+
+      Ash.Range.empty?(resumed) ->
+        {:ok, nil}
+
+      true ->
+        {:ok, resumed}
+    end
+  end
+
+  # The part of `written` that `version` holds.
+  defp overlap(version, written) do
+    {lower, lower_bounds} =
+      if later?(written.lower, version.lower),
+        do: {written.lower, written.bounds},
+        else: {version.lower, version.bounds}
+
+    {upper, upper_bounds} =
+      if earlier?(written.upper, version.upper),
+        do: {written.upper, written.bounds},
+        else: {version.upper, version.bounds}
+
+    %Ash.Range{
+      lower: lower,
+      upper: upper,
+      bounds: bounds(Ash.Range.lower_inclusive?(lower_bounds), upper_bounds)
+    }
+  end
+
+  # `nil` is unbounded: no lower is later, and no upper is earlier.
+  defp later?(_left, nil), do: true
+  defp later?(nil, _right), do: false
+  defp later?(left, right), do: Comp.greater_than?(left, right)
+
+  defp earlier?(_left, nil), do: true
+  defp earlier?(nil, _right), do: false
+  defp earlier?(left, right), do: Comp.less_than?(left, right)
+
+  defp bounds(lower_inclusive?, prior_bounds) do
+    case {lower_inclusive?, Ash.Range.upper_inclusive?(prior_bounds)} do
+      {true, true} -> :"[]"
+      {true, false} -> :"[)"
+      {false, true} -> :"(]"
+      {false, false} -> :"()"
+    end
+  end
+
+  defp carved(resource, pkey, period, stored, ranges) do
+    ranges
+    |> Enum.reject(&is_nil/1)
+    |> Enum.reduce_while({:ok, []}, fn range, {:ok, acc} ->
+      case version(resource, pkey, period, stored, range) do
+        {:ok, version} -> {:cont, {:ok, [version | acc]}}
+        {:error, error} -> {:halt, {:error, error}}
+      end
+    end)
   end
 
   defp has_filter?(filter) when filter in [nil, true], do: false
@@ -2038,22 +2511,26 @@ defmodule Ash.DataLayer.Ets do
     |> case do
       {:ok, results} ->
         Enum.reduce_while(results, acc, fn result, acc ->
-          result_changeset = %{changeset | data: result}
+          if touches_portion?(resource, result, changeset.as_of) do
+            result_changeset = %{changeset | data: result}
 
-          case update(query.resource, result_changeset, nil, true) do
-            {:ok, result} ->
-              result = Ash.Actions.Helpers.Bulk.put_metadata(result, result_changeset)
+            case update(query.resource, result_changeset, nil, true) do
+              {:ok, result} ->
+                result = Ash.Actions.Helpers.Bulk.put_metadata(result, result_changeset)
 
-              case acc do
-                :ok ->
-                  {:cont, :ok}
+                case acc do
+                  :ok ->
+                    {:cont, :ok}
 
-                {:ok, results} ->
-                  {:cont, {:ok, [result | results]}}
-              end
+                  {:ok, results} ->
+                    {:cont, {:ok, [result | results]}}
+                end
 
-            {:error, error} ->
-              {:halt, {:error, error}}
+              {:error, error} ->
+                {:halt, {:error, error}}
+            end
+          else
+            {:cont, acc}
           end
         end)
 
@@ -2062,17 +2539,37 @@ defmodule Ash.DataLayer.Ets do
     end
     |> case do
       :ok -> :ok
-      {:ok, results} -> {:ok, Enum.reverse(results)}
+      {:ok, results} -> {:ok, first_versions(resource, Enum.reverse(results))}
       {:error, error} -> {:error, error}
+    end
+  end
+
+  # A range can carve several versions of one record; the write returns the first of them.
+  defp first_versions(resource, results) do
+    case Ash.Resource.Info.temporal_attribute(resource) do
+      nil ->
+        results
+
+      attribute ->
+        firsts =
+          results
+          |> Enum.group_by(&primary_key(resource, &1))
+          |> Map.new(fn {key, versions} ->
+            {key, Enum.min_by(versions, &Map.get(&1, attribute).lower, Comp)}
+          end)
+
+        Enum.filter(results, &(Map.fetch!(firsts, primary_key(resource, &1)) == &1))
     end
   end
 
   @doc false
   @impl true
   def update(resource, changeset, pkey \\ nil, from_bulk? \\ false) do
-    pkey = pkey || pkey_map(resource, changeset.data)
+    supersede = supersession(resource, changeset)
+    range? = match?(%Ash.Range{}, changeset.as_of)
 
     with {:ok, table} <- wrap_or_create_table(resource, changeset.tenant, false),
+         pkey = pkey || holding_key(table, resource, changeset.data, supersede, range?),
          _ <- if(!from_bulk?, do: log_update(resource, pkey, changeset)),
          {:ok, record} <-
            do_update(
@@ -2081,13 +2578,15 @@ defmodule Ash.DataLayer.Ets do
              changeset.domain,
              changeset.tenant,
              resource,
-             changeset.context[:private][:actor]
+             changeset.context[:private][:actor],
+             supersede
            ),
          {:ok, record} <- cast_record(record, resource),
          record <- retain_fields(record, changeset) do
       new_pkey = pkey_map(resource, record)
 
-      if new_pkey != pkey do
+      # A supersession has already retired the old key, so it must not be destroyed.
+      if is_nil(supersede) && new_pkey != pkey do
         case destroy(resource, changeset) do
           :ok ->
             {:ok, %{record | __meta__: %Ecto.Schema.Metadata{state: :loaded, schema: resource}}}
@@ -2109,6 +2608,47 @@ defmodule Ash.DataLayer.Ets do
 
       {:error, error} ->
         {:error, error}
+    end
+  end
+
+  # `nil` writes in place: no period, or a period with no now to supersede at.
+  defp supersession(resource, changeset) do
+    with period when not is_nil(period) <- Ash.Resource.Info.temporal_attribute(resource),
+         {:ok, written} <- Ash.Temporal.write_period(resource, changeset.as_of) do
+      {period, written}
+    else
+      _ -> nil
+    end
+  end
+
+  # An instant write reaches the version holding its instant, as a SQL layer's `@> as_of`
+  # match does, rather than only the version the caller holds: that one may have been
+  # superseded since it was read. A range reaches the versions it overlaps on its own.
+  defp holding_key(table, resource, record, {period, %Ash.Range{lower: instant}}, false) do
+    pkey = pkey_map(resource, record)
+
+    with false <- holds?(table, pkey, period, instant),
+         {:ok, periods} <- stored_periods(table, resource, record),
+         %Ash.Range{} = holding <-
+           periods
+           |> Map.get(primary_key(resource, record), [])
+           |> Enum.find(&(match?(%Ash.Range{}, &1) and Ash.Range.contains?(&1, instant))) do
+      Map.put(pkey, period, holding)
+    else
+      _ -> pkey
+    end
+  end
+
+  defp holding_key(_table, resource, record, _supersede, _range?), do: pkey_map(resource, record)
+
+  defp holds?(table, pkey, period, instant) do
+    case Map.get(pkey, period) do
+      %Ash.Range{} = held ->
+        Ash.Range.contains?(held, instant) and
+          match?({:ok, {_key, stored}} when is_map(stored), ETS.Set.get(table, pkey))
+
+      _ ->
+        false
     end
   end
 
@@ -2139,10 +2679,19 @@ defmodule Ash.DataLayer.Ets do
   @doc false
   def pkey_map(resource, data) do
     resource
-    |> Ash.Resource.Info.primary_key()
+    |> key_fields()
     |> Enum.into(%{}, fn attr ->
       {attr, Map.get(data, attr)}
     end)
+  end
+
+  defp key_fields(resource) do
+    primary_key = Ash.Resource.Info.primary_key(resource)
+
+    case Ash.Resource.Info.temporal_attribute(resource) do
+      nil -> primary_key
+      period -> primary_key ++ [period]
+    end
   end
 
   defp do_update(
@@ -2151,7 +2700,8 @@ defmodule Ash.DataLayer.Ets do
          domain,
          tenant,
          resource,
-         actor
+         actor,
+         supersede
        ) do
     attributes = resource |> Ash.Resource.Info.attributes()
 
@@ -2166,12 +2716,13 @@ defmodule Ash.DataLayer.Ets do
                 empty when empty in [nil, []] ->
                   data = Map.merge(record, casted)
 
-                  put_data(table, pkey, data)
+                  write_version(table, pkey, record, data, resource, supersede)
 
                 atomics ->
-                  with {:ok, atomics} <- make_atomics(atomics, resource, domain, casted_record) do
-                    data = record |> Map.merge(casted) |> Map.merge(atomics)
-                    put_data(table, pkey, data)
+                  with {:ok, atomics} <- make_atomics(atomics, resource, domain, casted_record),
+                       {:ok, dumped_atomics} <- dump_atomics(atomics, attributes) do
+                    data = record |> Map.merge(casted) |> Map.merge(dumped_atomics)
+                    write_version(table, pkey, record, data, resource, supersede)
                   end
               end
             else
@@ -2189,7 +2740,7 @@ defmodule Ash.DataLayer.Ets do
           {:ok, _} ->
             {:error,
              Ash.Error.Changes.StaleRecord.exception(
-               resource: record.__struct__,
+               resource: resource,
                filter: changeset_filter
              )}
 
@@ -2199,6 +2750,119 @@ defmodule Ash.DataLayer.Ets do
 
       {:error, error} ->
         {:error, error}
+    end
+  end
+
+  defp write_version(table, pkey, _prior, data, _resource, nil), do: put_data(table, pkey, data)
+
+  # No transaction here, so the delete goes first: a reader sees the record absent, never
+  # twice.
+  defp write_version(table, pkey, prior_data, data, resource, {period, written}) do
+    prior = Map.get(pkey, period)
+    written = clip_to_prior(prior, written)
+
+    with {:ok, closed} <- close_at(prior, written.lower, resource, period),
+         {:ok, resumed} <- resume_after(prior, written, resource, period),
+         {:ok, opening} <- open_at(prior, written, resource, period),
+         {:ok, {_key, opened_data} = opened} <-
+           version(resource, pkey, period, data, opening),
+         {:ok, kept} <- carved(resource, pkey, period, prior_data, [closed, resumed]),
+         {:ok, table} <- ETS.Set.delete(table, pkey),
+         {:ok, _table} <- put_versions(table, kept ++ [opened]) do
+      {:ok, opened_data}
+    end
+  end
+
+  # A primary-key-only match reaches every version; one the portion misses is left as it was.
+  defp touches_portion?(resource, result, %Ash.Range{} = as_of) do
+    case Ash.Resource.Info.temporal_attribute(resource) do
+      nil ->
+        true
+
+      attribute ->
+        case Map.get(result, attribute) do
+          %Ash.Range{} = prior -> Ash.Range.intersects?(prior, as_of)
+          _ -> true
+        end
+    end
+  end
+
+  defp touches_portion?(_resource, _result, _as_of), do: true
+
+  # A version holding only part of a written period takes the part it holds, clipped here.
+  defp clip_to_prior(%Ash.Range{lower: prior_lower}, written) when is_nil(prior_lower) do
+    written
+  end
+
+  defp clip_to_prior(%Ash.Range{} = prior, written) do
+    lower =
+      if not is_nil(written.lower) and Comp.less_than?(written.lower, prior.lower) do
+        prior.lower
+      else
+        written.lower
+      end
+
+    upper =
+      case {prior.upper, written.upper} do
+        {nil, w} -> w
+        {p, nil} -> p
+        {p, w} -> if Comp.less_than?(p, w), do: p, else: w
+      end
+
+    %{written | lower: lower, upper: upper}
+  end
+
+  # An unbounded written upper leaves the prior's in place, so a bare instant is unchanged.
+  defp open_at(prior, %Ash.Range{lower: lower, upper: nil}, _resource, _period),
+    do: {:ok, %{prior | lower: lower}}
+
+  defp open_at(%Ash.Range{} = prior, %Ash.Range{} = written, resource, period) do
+    opening = %{prior | lower: written.lower, upper: written.upper, bounds: written.bounds}
+
+    if Ash.Range.contains?(prior, opening) do
+      {:ok, opening}
+    else
+      {:error,
+       Ash.Error.Changes.PeriodOutOfBounds.exception(
+         resource: resource,
+         field: period,
+         period: opening,
+         within: prior
+       )}
+    end
+  end
+
+  # An instant the version does not hold cannot split it. `nil` drops a half holding none.
+  # Nothing lies before an unbounded lower, so nothing is kept.
+  defp close_at(%Ash.Range{}, nil, _resource, _period), do: {:ok, nil}
+
+  defp close_at(%Ash.Range{} = prior, as_of, resource, period) do
+    closed = %{prior | upper: as_of}
+
+    cond do
+      not Ash.Range.contains?(prior, as_of) ->
+        {:error, Ash.Error.Changes.StaleRecord.exception(resource: resource, field: period)}
+
+      Ash.Range.empty?(closed) ->
+        {:ok, nil}
+
+      true ->
+        {:ok, closed}
+    end
+  end
+
+  defp close_at(_prior, _as_of, resource, period) do
+    {:error, Ash.Error.Changes.StaleRecord.exception(resource: resource, field: period)}
+  end
+
+  # Cast in the key, dumped in the data, as every other write leaves it.
+  defp version(resource, pkey, period, data, range) do
+    attribute = Ash.Resource.Info.temporal_period(resource)
+
+    case Ash.Type.dump_to_native(attribute.type, range, attribute.constraints) do
+      {:ok, dumped} -> {:ok, {%{pkey | period => range}, Map.put(data, period, dumped)}}
+      :error -> {:error, "could not store the period #{inspect(range)}"}
+      {:error, error} -> {:error, error}
     end
   end
 
@@ -2212,6 +2876,33 @@ defmodule Ash.DataLayer.Ets do
 
       error ->
         error
+    end
+  end
+
+  defp dump_atomics(atomics, attributes) do
+    attributes
+    |> Enum.filter(&Map.has_key?(atomics, &1.name))
+    |> Enum.reduce_while({:ok, %{}}, fn attribute, {:ok, acc} ->
+      case Ash.Type.cast_input(
+             attribute.type,
+             Map.get(atomics, attribute.name),
+             attribute.constraints
+           ) do
+        {:ok, value} ->
+          {:cont, {:ok, Map.put(acc, attribute.name, value)}}
+
+        _ ->
+          {:halt,
+           {:error,
+            Ash.Error.Changes.InvalidAttribute.exception(
+              field: attribute.name,
+              message: "is invalid"
+            )}}
+      end
+    end)
+    |> case do
+      {:ok, casted} -> dump_to_native(casted, attributes)
+      {:error, error} -> {:error, error}
     end
   end
 

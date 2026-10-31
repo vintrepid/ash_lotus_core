@@ -9,6 +9,9 @@ defmodule Ash.Resource.Change.GetAndLock do
   use Ash.Resource.Change
 
   @impl true
+  def temporal_safe?(_opts), do: true
+
+  @impl true
   def change(changeset, opts, context) do
     Ash.Changeset.before_action(changeset, fn changeset ->
       primary_key = Ash.Resource.Info.primary_key(changeset.resource)
@@ -41,7 +44,7 @@ defmodule Ash.Resource.Change.GetAndLock do
       {:not_atomic,
        """
        Cannot lock during an atomic update. If no lock is necessary in an atomic situation,
-       add `skip_atomic_?: true`, i.e `change get_and_lock(#{opts[:lock]}, skip_atomic?: true)`
+       add `skip_atomic?: true`, i.e `change get_and_lock(#{inspect(opts[:lock])}, skip_atomic?: true)`
        """}
     end
   end

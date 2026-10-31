@@ -26,6 +26,20 @@ defmodule Ash.Type.RangeTest do
     assert Ash.Type.get_type(:range) == Ash.Type.Range
   end
 
+  test "a NewType of a supported inner type may be the inner type, and keeps its constraints" do
+    {:ok, constraints} = Ash.Type.init(Ash.Type.Range, inner_type: :utc_datetime_usec)
+    lower = ~U[2026-01-01 00:00:00.123456Z]
+
+    assert {:ok, %Range{lower: ^lower}} =
+             Ash.Type.cast_input(Ash.Type.Range, %{lower: lower, upper: nil}, constraints)
+
+    assert Ash.Type.Range.base_type(constraints[:inner_type]) == Ash.Type.DateTime
+  end
+
+  test "an inner type that is not a supported type, or a NewType of one, is refused" do
+    assert {:error, _} = Ash.Type.init(Ash.Type.Range, inner_type: :string)
+  end
+
   test "storage_type is the logical :range (data layer chooses the concrete type)" do
     assert Ash.Type.Range.storage_type(@constraints) == :range
     assert Ash.Type.Range.storage_type(@date_constraints) == :range
@@ -200,7 +214,7 @@ defmodule Ash.Type.RangeTest do
       assert {:ok, _} = apply!(%Range{lower: nil, upper: @upper, bounds: :"()"}, constraints)
     end
 
-    test "a discrete range canonicalized to an exclusive lower still satisfies inclusive?" do
+    test "a discrete exclusive lower, cast to an inclusive one, satisfies inclusive?" do
       # `(,5]` canonicalizes to `(,6)`, so the lower is exclusive only because it is absent.
       constraints = init!(inner_type: :integer, lower: [inclusive?: true])
 
@@ -212,6 +226,147 @@ defmodule Ash.Type.RangeTest do
         )
 
       assert {:ok, _} = apply!(range, constraints)
+    end
+
+    test "a discrete range refuses inclusivity its `[)` form can never have" do
+      for constraints <- [
+            [inner_type: :integer],
+            [inner_type: :date],
+            [inner_type: :datetime, resolution: Duration.new!(hour: 1)]
+          ] do
+        assert {:error, _} =
+                 Ash.Type.init(Ash.Type.Range, constraints ++ [lower: [inclusive?: false]])
+
+        assert {:error, _} =
+                 Ash.Type.init(Ash.Type.Range, constraints ++ [upper: [inclusive?: true]])
+
+        assert {:ok, _} =
+                 Ash.Type.init(
+                   Ash.Type.Range,
+                   constraints ++ [lower: [inclusive?: true], upper: [inclusive?: false]]
+                 )
+      end
+    end
+
+    test "a continuous range accepts either inclusivity" do
+      assert {:ok, _} =
+               Ash.Type.init(Ash.Type.Range,
+                 inner_type: :datetime,
+                 lower: [inclusive?: false],
+                 upper: [inclusive?: true]
+               )
+    end
+
+    test "a lower bound must be at or above its limit, whatever its inclusivity" do
+      constraints = init!(inner_type: :datetime, lower: [limit: @lower])
+
+      assert {:ok, _} = apply!(%Range{lower: @lower, upper: @upper, bounds: :"[)"}, constraints)
+      assert {:ok, _} = apply!(%Range{lower: @lower, upper: @upper, bounds: :"()"}, constraints)
+
+      assert {:error, _} =
+               apply!(
+                 %Range{lower: ~U[2025-12-31 23:59:59.999999Z], upper: @upper, bounds: :"(]"},
+                 constraints
+               )
+    end
+
+    test "an upper limit is excluded: an exclusive bound may meet it, an inclusive one may not" do
+      constraints = init!(inner_type: :datetime, upper: [limit: @upper])
+
+      assert {:ok, _} = apply!(%Range{lower: @lower, upper: @upper, bounds: :"[)"}, constraints)
+
+      assert {:error, _} =
+               apply!(%Range{lower: @lower, upper: @upper, bounds: :"[]"}, constraints)
+
+      assert {:ok, _} =
+               apply!(
+                 %Range{lower: @lower, upper: ~U[2026-01-31 23:59:59.999999Z], bounds: :"[]"},
+                 constraints
+               )
+
+      assert {:error, _} =
+               apply!(
+                 %Range{lower: @lower, upper: ~U[2026-02-01 00:00:00.000001Z], bounds: :"[)"},
+                 constraints
+               )
+    end
+
+    test "a limited end must be there, since an unbounded end runs past any limit" do
+      lower = init!(inner_type: :integer, lower: [limit: 1])
+      upper = init!(inner_type: :integer, upper: [limit: 10])
+
+      assert {:error, _} = apply!(%Range{lower: nil, upper: 5, bounds: :"()"}, lower)
+      assert {:error, _} = apply!(%Range{lower: 1, upper: nil, bounds: :"[)"}, upper)
+    end
+
+    test "a discrete inclusive upper at the limit is cast past it" do
+      constraints = init!(inner_type: :integer, upper: [limit: 10])
+
+      {:ok, at_limit} =
+        Ash.Type.cast_input(
+          Ash.Type.Range,
+          %Range{lower: 1, upper: 10, bounds: :"[]"},
+          constraints
+        )
+
+      {:ok, below} =
+        Ash.Type.cast_input(
+          Ash.Type.Range,
+          %Range{lower: 1, upper: 9, bounds: :"[]"},
+          constraints
+        )
+
+      assert {:error, _} = apply!(at_limit, constraints)
+      assert {:ok, %Range{upper: 10, bounds: :"[)"}} = apply!(below, constraints)
+    end
+
+    test "a limit is cast by the inner type" do
+      constraints = init!(inner_type: :date, lower: [limit: "2025-01-01"])
+
+      assert constraints[:lower][:limit] == ~D[2025-01-01]
+
+      assert {:error, _} =
+               apply!(%Range{lower: ~D[2024-12-31], upper: ~D[2025-02-01]}, constraints)
+    end
+
+    test "a limit the inner type cannot cast is refused" do
+      assert {:error, _} =
+               Ash.Type.init(Ash.Type.Range, inner_type: :date, lower: [limit: "never"])
+    end
+
+    test ":start and :end are the limits" do
+      constraints = init!(inner_type: :integer, lower: [limit: 1], upper: [limit: 10])
+
+      assert {:ok, %Range{lower: 1, upper: 10, bounds: :"[)"}} =
+               Ash.Type.cast_input(
+                 Ash.Type.Range,
+                 %Range{lower: :start, upper: :end},
+                 constraints
+               )
+    end
+
+    test ":start and :end are unbounded where there is no limit" do
+      lower_only = init!(inner_type: :integer, lower: [limit: 1])
+
+      assert {:ok, %Range{lower: 1, upper: nil}} =
+               Ash.Type.cast_input(Ash.Type.Range, %Range{lower: :start, upper: :end}, lower_only)
+
+      assert {:ok, %Range{lower: nil, upper: nil}} =
+               Ash.Type.cast_input(
+                 Ash.Type.Range,
+                 %Range{lower: :start, upper: :end},
+                 init!(inner_type: :integer)
+               )
+    end
+
+    test ":start and :end name one end each" do
+      constraints = init!(inner_type: :integer, lower: [limit: 1], upper: [limit: 10])
+
+      assert {:error, _} =
+               Ash.Type.cast_input(Ash.Type.Range, %Range{lower: :end, upper: 5}, constraints)
+
+      assert {:error, _} =
+               Ash.Type.cast_input(Ash.Type.Range, %Range{lower: 2, upper: :start}, constraints)
     end
 
     test "unconstrained by default" do
@@ -267,7 +422,7 @@ defmodule Ash.Type.RangeTest do
       end
     end
 
-    test "the pairs cover every relation, in canonical order" do
+    test "the pairs cover every relation, in Allen's order" do
       assert Keyword.keys(pairs()) == Range.relations()
     end
 
@@ -280,7 +435,7 @@ defmodule Ash.Type.RangeTest do
       end
     end
 
-    test "meets needs exactly one side to include the point" do
+    test "meets needs exactly one side to include the value" do
       assert Range.relation(ar(1, 5, :"[)"), ar(5, 9, :"[)")) == :meets
       assert Range.relation(ar(1, 5, :"[]"), ar(5, 9, :"[)")) == :overlaps
       assert Range.relation(ar(1, 5, :"[)"), ar(5, 9, :"()")) == :precedes
@@ -304,13 +459,13 @@ defmodule Ash.Type.RangeTest do
     # for case, canonical form included.
     defp adj(lower, upper, bounds), do: %Range{lower: lower, upper: upper, bounds: bounds}
 
-    test "one ends where the other begins, with exactly one side including the seam" do
+    test "one ends where the other begins, with exactly one side including that value" do
       assert Range.adjacent?(adj(1, 5, :"[)"), adj(5, 9, :"[)"))
       assert Range.adjacent?(adj(1, 5, :"()"), adj(5, 9, :"[)"))
       assert Range.adjacent?(adj(1, 5, :"[)"), adj(5, 9, :"[]"))
     end
 
-    test "sharing the seam is overlap, and excluding it from both leaves a gap" do
+    test "sharing the value is overlap, and excluding it from both leaves a gap" do
       refute Range.adjacent?(adj(1, 5, :"[]"), adj(5, 9, :"[)"))
       refute Range.adjacent?(adj(1, 5, :"()"), adj(5, 9, :"()"))
       refute Range.adjacent?(adj(1, 5, :"[)"), adj(6, 9, :"[)"))
@@ -332,7 +487,7 @@ defmodule Ash.Type.RangeTest do
       refute Range.adjacent?(Range.empty(), Range.empty())
     end
 
-    test "a discrete inner type answers on the canonical form" do
+    test "a discrete inner type answers on the [) form" do
       {:ok, constraints} = Ash.Type.init(Ash.Type.Range, inner_type: :integer)
       {:ok, left} = Ash.Type.cast_input(Ash.Type.Range, adj(1, 4, :"[]"), constraints)
       {:ok, right} = Ash.Type.cast_input(Ash.Type.Range, adj(5, 9, :"[)"), constraints)
@@ -342,7 +497,7 @@ defmodule Ash.Type.RangeTest do
       refute Range.adjacent?(adj(1, 4, :"[]"), adj(5, 9, :"[)"))
     end
 
-    test "adjacent ranges tile, covering everything between without overlapping" do
+    test "consecutive ranges hold every value between them once" do
       tiles = [adj(1, 5, :"[)"), adj(5, 9, :"[)"), adj(9, 13, :"[)")]
 
       assert tiles
@@ -435,12 +590,12 @@ defmodule Ash.Type.RangeTest do
                cast!(%Range{lower: 1, upper: 5, bounds: :"()"}, int)
     end
 
-    test "both bounds move where both are non-canonical", %{int: int} do
+    test "both bounds move where neither is [)", %{int: int} do
       assert %Range{lower: 2, upper: 6, bounds: :"[)"} =
                cast!(%Range{lower: 1, upper: 5, bounds: :"(]"}, int)
     end
 
-    test "a range already in canonical form is unchanged", %{int: int} do
+    test "a range already [) is unchanged", %{int: int} do
       assert %Range{lower: 1, upper: 5, bounds: :"[)"} =
                cast!(%Range{lower: 1, upper: 5, bounds: :"[)"}, int)
     end
@@ -450,7 +605,7 @@ defmodule Ash.Type.RangeTest do
                cast!(%Range{lower: 1, upper: 6, bounds: :"[)"}, int)
     end
 
-    test "a single point keeps its point", %{int: int} do
+    test "a range of a single value keeps its value", %{int: int} do
       assert %Range{lower: 5, upper: 6, bounds: :"[)"} =
                cast!(%Range{lower: 5, upper: 5, bounds: :"[]"}, int)
     end
@@ -467,7 +622,7 @@ defmodule Ash.Type.RangeTest do
                cast!(%Range{lower: 1, upper: nil, bounds: :"[]"}, int)
     end
 
-    test "dates canonicalise by day", %{date: date} do
+    test "dates are cast to [) by the day", %{date: date} do
       assert %Range{lower: ~D[2026-01-01], upper: ~D[2026-01-09], bounds: :"[)"} =
                cast!(%Range{lower: ~D[2026-01-01], upper: ~D[2026-01-08], bounds: :"[]"}, date)
     end
@@ -493,7 +648,7 @@ defmodule Ash.Type.RangeTest do
                )
     end
 
-    test "apply_constraints canonicalises a value that skipped casting", %{int: int} do
+    test "apply_constraints casts to [) a value that skipped casting", %{int: int} do
       assert {:ok, %Range{lower: 1, upper: 6, bounds: :"[)"}} =
                Ash.Type.apply_constraints(
                  Ash.Type.Range,
@@ -503,8 +658,313 @@ defmodule Ash.Type.RangeTest do
     end
   end
 
+  describe "resolution" do
+    defp grid!(constraints), do: Ash.Type.init(Ash.Type.Range, constraints) |> elem(1)
+
+    test "without one, a range's resolution is its inner type's precision" do
+      {:ok, second} = Ash.Type.init(Ash.Type.Range, inner_type: :utc_datetime)
+      {:ok, naive} = Ash.Type.init(Ash.Type.Range, inner_type: :naive_datetime)
+
+      assert Ash.Type.Range.resolution(@int_constraints) == 1
+      assert Ash.Type.Range.resolution(@date_constraints) == Duration.new!(day: 1)
+      assert Ash.Type.Range.resolution(second) == Duration.new!(second: 1)
+      assert Ash.Type.Range.resolution(@constraints) == Duration.new!(microsecond: {1, 6})
+      assert Ash.Type.Range.resolution(naive) == Duration.new!(second: 1)
+    end
+
+    test "is cast through Ash.Type.Duration, into its canonical units" do
+      assert grid!(inner_type: :date, resolution: "P2W")[:resolution] ==
+               Duration.new!(week: 2)
+
+      assert {:error, _} = Ash.Type.init(Ash.Type.Range, inner_type: :date, resolution: [week: 2])
+
+      assert grid!(
+               inner_type: :date,
+               resolution: Duration.new!(month: 15),
+               anchor: ~D[2025-07-01]
+             )[
+               :resolution
+             ] == Duration.new!(year: 1, month: 3)
+
+      assert Ash.Type.Range.resolution(
+               grid!(inner_type: :utc_datetime, resolution: Duration.new!(minute: 90))
+             ) == Duration.new!(hour: 1, minute: 30)
+    end
+
+    test "a range on its grid casts to its one [) form, a resolution on" do
+      constraints = grid!(inner_type: :utc_datetime, resolution: Duration.new!(minute: 5))
+
+      assert %Range{lower: ~U[2026-10-07 10:05:00Z], upper: ~U[2026-10-07 10:15:00Z]} =
+               cast!(
+                 %Range{
+                   lower: ~U[2026-10-07 10:05:00Z],
+                   upper: ~U[2026-10-07 10:10:00Z],
+                   bounds: :"[]"
+                 },
+                 constraints
+               )
+
+      assert %Range{lower: ~U[2026-10-07 10:10:00Z], upper: ~U[2026-10-07 10:15:00Z]} =
+               cast!(
+                 %Range{
+                   lower: ~U[2026-10-07 10:05:00Z],
+                   upper: ~U[2026-10-07 10:15:00Z],
+                   bounds: :"()"
+                 },
+                 constraints
+               )
+
+      assert %Range{lower: 0, upper: 20, bounds: :"[)"} =
+               cast!(
+                 %Range{lower: 0, upper: 10, bounds: :"[]"},
+                 grid!(inner_type: :integer, resolution: 10)
+               )
+    end
+
+    test "a bound off the grid is refused" do
+      constraints = grid!(inner_type: :utc_datetime, resolution: Duration.new!(minute: 5))
+
+      assert {:ok, _} =
+               apply!(
+                 %Range{lower: ~U[2026-10-07 10:05:00Z], upper: ~U[2026-10-07 10:10:00Z]},
+                 constraints
+               )
+
+      assert {:error, error} =
+               apply!(
+                 %Range{lower: ~U[2026-10-07 10:06:00Z], upper: ~U[2026-10-07 10:10:00Z]},
+                 constraints
+               )
+
+      assert error[:message] =~ "must be on the grid of its resolution"
+      assert error[:vars][:bound] == :lower
+
+      assert {:error, _} =
+               apply!(
+                 %Range{lower: ~U[2026-10-07 10:05:00Z], upper: ~U[2026-10-07 10:10:30Z]},
+                 constraints
+               )
+    end
+
+    test "the period of a value starts on the grid, at or before it" do
+      quarters =
+        grid!(inner_type: :date, resolution: Duration.new!(month: 3), anchor: ~D[2025-07-01])
+
+      fortnights =
+        grid!(inner_type: :date, resolution: Duration.new!(week: 2), anchor: ~D[2025-06-23])
+
+      tens = grid!(inner_type: :integer, resolution: 10)
+
+      assert {:ok, %Range{lower: ~D[2026-01-01], upper: ~D[2026-04-01]}} =
+               Ash.Type.Range.period(~D[2026-02-14], quarters)
+
+      assert {:ok, %Range{lower: ~D[2025-04-01], upper: ~D[2025-07-01]}} =
+               Ash.Type.Range.period(~D[2025-06-30], quarters)
+
+      assert {:ok, %Range{lower: ~D[2019-02-25], upper: ~D[2019-03-11]}} =
+               Ash.Type.Range.period(~D[2019-03-05], fortnights)
+
+      assert {:ok, %Range{lower: -10, upper: 0}} = Ash.Type.Range.period(-3, tens)
+
+      five_quarters =
+        grid!(
+          inner_type: :date,
+          resolution: Duration.new!(year: 1, month: 3),
+          anchor: ~D[2025-07-01]
+        )
+
+      fifteen_months =
+        grid!(inner_type: :date, resolution: Duration.new!(month: 15), anchor: ~D[2025-07-01])
+
+      for grid <- [five_quarters, fifteen_months] do
+        assert {:ok, %Range{lower: ~D[2026-10-01], upper: ~D[2028-01-01]}} =
+                 Ash.Type.Range.period(~D[2026-12-01], grid)
+      end
+    end
+
+    test "a month grid counts whole months from the anchor, by its day" do
+      monthly =
+        grid!(inner_type: :date, resolution: Duration.new!(month: 1), anchor: ~D[2025-01-15])
+
+      assert {:ok, %Range{lower: ~D[2025-02-15], upper: ~D[2025-03-15]}} =
+               Ash.Type.Range.period(~D[2025-03-10], monthly)
+
+      assert {:ok, %Range{lower: ~D[2025-03-15], upper: ~D[2025-04-15]}} =
+               Ash.Type.Range.period(~D[2025-03-15], monthly)
+    end
+
+    test "without an anchor, minutes follow the UTC clock and weeks start on Monday" do
+      assert {:ok, %Range{lower: ~U[2026-10-07 10:05:00Z], upper: ~U[2026-10-07 10:10:00Z]}} =
+               Ash.Type.Range.period(
+                 ~U[2026-10-07 10:07:30Z],
+                 grid!(inner_type: :utc_datetime, resolution: Duration.new!(minute: 5))
+               )
+
+      assert {:ok, %Range{lower: ~D[2026-10-05], upper: ~D[2026-10-12]}} =
+               Ash.Type.Range.period(
+                 ~D[2026-10-07],
+                 grid!(inner_type: :date, resolution: Duration.new!(week: 1))
+               )
+    end
+
+    test "a resolution or anchor that cannot make a grid is refused" do
+      for constraints <- [
+            [inner_type: :date, resolution: Duration.new!(day: 0)],
+            [inner_type: :date, resolution: Duration.new!(day: -1)],
+            [inner_type: :date, resolution: "banana"],
+            [
+              inner_type: :date,
+              resolution: Duration.new!(month: 1, day: 3),
+              anchor: ~D[2025-01-01]
+            ],
+            [inner_type: :date, resolution: Duration.new!(hour: 36)],
+            [inner_type: :utc_datetime, resolution: Duration.new!(microsecond: {500_000, 3})],
+            [inner_type: :date, resolution: Duration.new!(month: 3)],
+            [inner_type: :date, resolution: Duration.new!(month: 1), anchor: ~D[2025-01-31]],
+            [inner_type: :date, resolution: Duration.new!(week: 2), anchor: "never"],
+            [inner_type: :date, anchor: ~D[2025-06-23]],
+            [inner_type: :integer, resolution: Duration.new!(day: 1)],
+            [inner_type: :integer, resolution: 10, lower: [limit: 5]]
+          ] do
+        assert {:error, _} = Ash.Type.init(Ash.Type.Range, constraints),
+               "expected #{inspect(constraints)} to be refused"
+      end
+    end
+
+    test "an anchor the inner type would change is refused" do
+      for anchor <- [~U[2025-07-01 00:00:00.5Z], ~D[2025-07-01]] do
+        assert {:error, message} =
+                 Ash.Type.init(Ash.Type.Range,
+                   inner_type: :utc_datetime,
+                   resolution: Duration.new!(day: 1),
+                   anchor: anchor
+                 )
+
+        assert message =~ "is not a value of the inner type as it holds it"
+      end
+    end
+
+    test "an anchor in a time zone aligns periods of a day or longer to its time of day" do
+      sydney = DateTime.new!(~D[2025-07-01], ~T[00:00:00], "Australia/Sydney")
+
+      years = grid!(inner_type: :utc_datetime, resolution: Duration.new!(year: 1), anchor: sydney)
+
+      months =
+        grid!(inner_type: :utc_datetime, resolution: Duration.new!(month: 1), anchor: sydney)
+
+      days = grid!(inner_type: :utc_datetime, resolution: Duration.new!(day: 1), anchor: sydney)
+
+      assert {:ok, %Range{lower: ~U[2025-06-30 14:00:00Z], upper: ~U[2026-06-30 14:00:00Z]}} =
+               Ash.Type.Range.period(~U[2026-01-15 00:00:00Z], years)
+
+      assert {:ok, %Range{lower: ~U[2025-10-31 13:00:00Z], upper: ~U[2025-11-30 13:00:00Z]}} =
+               Ash.Type.Range.period(~U[2025-11-15 00:00:00Z], months)
+
+      assert {:ok, %Range{lower: ~U[2025-10-04 14:00:00Z], upper: ~U[2025-10-05 13:00:00Z]}} =
+               Ash.Type.Range.period(~U[2025-10-05 01:00:00Z], days)
+
+      nine = DateTime.new!(~D[2025-07-01], ~T[09:00:00], "Australia/Sydney")
+      mornings = grid!(inner_type: :utc_datetime, resolution: Duration.new!(day: 1), anchor: nine)
+
+      # 08:00 on 10 October in Sydney is before that day's 09:00, so in the day from the 9th.
+      assert {:ok, %Range{lower: ~U[2025-10-08 22:00:00Z], upper: ~U[2025-10-09 22:00:00Z]}} =
+               Ash.Type.Range.period(~U[2025-10-09 21:00:00Z], mornings)
+    end
+
+    test "below a day, an anchor in a time zone gives periods of fixed elapsed time" do
+      adelaide = DateTime.new!(~D[2025-07-01], ~T[00:00:00], "Australia/Adelaide")
+
+      hours =
+        grid!(inner_type: :utc_datetime, resolution: Duration.new!(hour: 1), anchor: adelaide)
+
+      assert {:ok, %Range{lower: ~U[2025-07-01 02:30:00Z], upper: ~U[2025-07-01 03:30:00Z]}} =
+               Ash.Type.Range.period(~U[2025-07-01 03:10:00Z], hours)
+    end
+
+    test "an anchor in a time zone is refused where a day of its grid would be skipped, repeated or split" do
+      two_thirty = DateTime.new!(~D[2025-07-01], ~T[02:30:00], "Australia/Sydney")
+      midnight = DateTime.new!(~D[2025-07-01], ~T[00:00:00], "Australia/Sydney")
+
+      assert {:error, message} =
+               Ash.Type.init(Ash.Type.Range,
+                 inner_type: :utc_datetime,
+                 resolution: Duration.new!(day: 1),
+                 anchor: two_thirty
+               )
+
+      assert message =~ "falls in a gap or an overlap of Australia/Sydney"
+
+      assert {:error, message} =
+               Ash.Type.init(Ash.Type.Range,
+                 inner_type: :utc_datetime,
+                 resolution: Duration.new!(day: 1, hour: 12),
+                 anchor: midnight
+               )
+
+      assert message =~ "is a whole number of days"
+
+      assert {:ok, _} =
+               Ash.Type.init(Ash.Type.Range,
+                 inner_type: :utc_datetime,
+                 resolution: Duration.new!(hour: 1),
+                 anchor: two_thirty
+               )
+    end
+
+    test "an anchor the inner type holds as given is accepted, whatever its declared precision" do
+      assert {:ok, constraints} =
+               Ash.Type.init(Ash.Type.Range,
+                 inner_type: :utc_datetime,
+                 resolution: Duration.new!(day: 1),
+                 anchor: ~U[2025-07-01 00:00:00.000000Z]
+               )
+
+      assert constraints[:anchor] == ~U[2025-07-01 00:00:00Z]
+    end
+
+    test "a finer precision admits a finer resolution" do
+      assert {:ok, _} =
+               Ash.Type.init(Ash.Type.Range,
+                 inner_type: :utc_datetime_usec,
+                 resolution: Duration.new!(microsecond: {500_000, 3})
+               )
+    end
+  end
+
+  describe "period/2" do
+    test "is the range from a value to the next value of its inner type" do
+      assert {:ok, %Range{lower: 5, upper: 6, bounds: :"[)"}} =
+               Ash.Type.Range.period(5, @int_constraints)
+
+      assert {:ok, %Range{lower: ~D[2026-10-07], upper: ~D[2026-10-08]}} =
+               Ash.Type.Range.period(~D[2026-10-07], @date_constraints)
+    end
+
+    test "a datetime's next value is one unit of its precision on, after the value is cast" do
+      {:ok, second} = Ash.Type.init(Ash.Type.Range, inner_type: :utc_datetime)
+      {:ok, naive} = Ash.Type.init(Ash.Type.Range, inner_type: :naive_datetime)
+
+      assert {:ok, %Range{lower: ~U[2026-10-07 10:00:00Z], upper: ~U[2026-10-07 10:00:01Z]}} =
+               Ash.Type.Range.period(~U[2026-10-07 10:00:00.5Z], second)
+
+      assert {:ok,
+              %Range{
+                lower: ~U[2026-10-07 10:00:00.500000Z],
+                upper: ~U[2026-10-07 10:00:00.500001Z]
+              }} = Ash.Type.Range.period(~U[2026-10-07 10:00:00.500000Z], @constraints)
+
+      assert {:ok, %Range{lower: ~N[2026-10-07 10:00:00], upper: ~N[2026-10-07 10:00:01]}} =
+               Ash.Type.Range.period(~N[2026-10-07 10:00:00.5], naive)
+    end
+
+    test "a value the inner type cannot cast is refused" do
+      assert {:error, _} = Ash.Type.Range.period("banana", @date_constraints)
+      assert {:error, _} = Ash.Type.Range.period(nil, @int_constraints)
+    end
+  end
+
   describe "empty ranges" do
-    test "a discrete range on one point is empty unless both bounds include it" do
+    test "a discrete range on one value is empty unless both bounds include it" do
       {:ok, constraints} = Ash.Type.init(Ash.Type.Range, inner_type: :integer)
 
       cast = fn bounds ->
@@ -542,7 +1002,7 @@ defmodule Ash.Type.RangeTest do
       assert {:error, _} = Ash.Type.apply_constraints(Ash.Type.Range, cast, constraints)
     end
 
-    test "a range admitting no points casts to the empty range" do
+    test "a range holding no values casts to the empty range" do
       assert {:ok, %Range{empty?: true, lower: nil, upper: nil}} =
                Ash.Type.cast_input(
                  Ash.Type.Range,
@@ -562,7 +1022,7 @@ defmodule Ash.Type.RangeTest do
       assert at_lower == Range.empty()
     end
 
-    test "a range with both bounds inclusive is the single point, not empty" do
+    test "a range with both bounds inclusive is the single value, not empty" do
       assert {:ok, %Range{empty?: false, lower: @lower, upper: @lower}} =
                Ash.Type.cast_input(
                  Ash.Type.Range,
@@ -607,7 +1067,7 @@ defmodule Ash.Type.RangeTest do
                Ash.Type.apply_constraints(Ash.Type.Range, Range.empty(), constraints)
     end
 
-    test "empty?/1 reports emptiness whether canonical or implied by the bounds" do
+    test "empty?/1 reports emptiness whether empty/0 or implied by the bounds" do
       assert Range.empty?(Range.empty())
       assert Range.empty?(%Range{lower: 5, upper: 5, bounds: :"[)"})
       assert Range.empty?(%Range{lower: 6, upper: 5, bounds: :"[]"})
@@ -693,7 +1153,7 @@ defmodule Ash.Type.RangeTest do
   end
 
   describe "intersects?/2" do
-    test "two ranges sharing points intersect, in either order" do
+    test "two ranges sharing values intersect, in either order" do
       left = %Range{lower: 1, upper: 5, bounds: :"[)"}
       right = %Range{lower: 4, upper: 9, bounds: :"[)"}
 
@@ -708,14 +1168,14 @@ defmodule Ash.Type.RangeTest do
              )
     end
 
-    test "adjacent ranges do not intersect, which is what lets them tile" do
+    test "adjacent ranges do not intersect" do
       refute Range.intersects?(
                %Range{lower: 1, upper: 3, bounds: :"[)"},
                %Range{lower: 3, upper: 5, bounds: :"[)"}
              )
     end
 
-    test "a shared boundary is a shared point only when both sides include it" do
+    test "bounds on the same value share it only when both include it" do
       assert Range.intersects?(
                %Range{lower: 1, upper: 3, bounds: :"[]"},
                %Range{lower: 3, upper: 5, bounds: :"[)"}
