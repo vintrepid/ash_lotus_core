@@ -403,7 +403,7 @@ defmodule Ash.MixProject do
       # DSLs
       {:spark, "~> 2.7 and >= 2.7.9"},
       # Ash resources are backed by ecto scheams
-      {:ecto, "~> 3.14 and >= 3.14.2"},
+      {:ecto, "~> 3.14 and >= 3.14.3"},
       # Used by the ETS data layer
       {:ets, "~> 0.9.0"},
       # Data & types
@@ -435,7 +435,7 @@ defmodule Ash.MixProject do
       {:ex_check, "~> 0.17.1", only: [:dev, :test]},
       {:credo, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:dialyxir, ">= 0.0.0", only: [:dev, :test], runtime: false},
-      {:mimic, "~> 2.4 and >= 2.4.2", only: [:test]},
+      {:mimic, "~> 2.5", only: [:test]},
       {:sobelow, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:git_ops, "~> 2.12 and >= 2.12.3", only: [:dev, :test]},
       {:mix_audit, ">= 0.0.0", only: [:dev, :test], runtime: false},
