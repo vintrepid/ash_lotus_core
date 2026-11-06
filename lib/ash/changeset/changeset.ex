@@ -5413,7 +5413,8 @@ defmodule Ash.Changeset do
           {:ok, new_result, new_notifications} ->
             all_notifications =
               Enum.map(
-                List.wrap(notifications) ++ Ash.Notifier.Notification.normalize(new_notifications),
+                List.wrap(notifications) ++
+                  Ash.Notifier.Notification.normalize(new_notifications),
                 fn notification ->
                   %{
                     notification
