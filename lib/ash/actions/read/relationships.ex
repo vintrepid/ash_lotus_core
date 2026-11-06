@@ -384,7 +384,7 @@ defmodule Ash.Actions.Read.Relationships do
         # `parent/1` in this filter refers to the record the destination is reached from, not
         # the source record, so such a filter gets a step of its own in the lateral join.
         if last_through_relationship &&
-             !do_has_parent_expr?(last_through_relationship.filter) do
+             !Ash.Filter.has_parent_expr?(last_through_relationship.filter) do
           Ash.Query.do_filter(
             related_query,
             RelatedAuthorization.trusted_filter(
@@ -616,7 +616,7 @@ defmodule Ash.Actions.Read.Relationships do
   defp through_destination_steps(relationship, source_query, related_query) do
     last = last_through_relationship(relationship)
 
-    if do_has_parent_expr?(last.filter) || relationship_limit(last) ||
+    if Ash.Filter.has_parent_expr?(last.filter) || relationship_limit(last) ||
          Map.get(last, :offset) do
       case Ash.Resource.Info.primary_key(last.destination) do
         [primary_key] ->
@@ -2126,7 +2126,7 @@ defmodule Ash.Actions.Read.Relationships do
       %{type: :many_to_many} ->
         # `parent/1` in a many_to_many's filter refers to its source record, which is two
         # steps back once the join resource is a step of its own.
-        if do_has_parent_expr?(relationship.filter) do
+        if Ash.Filter.has_parent_expr?(relationship.filter) do
           raise ArgumentError,
                 "The filter of many_to_many relationship `#{relationship.name}` on " <>
                   "#{inspect(resource)} uses `parent/1`, so it can't be a step in a through path."
@@ -2180,7 +2180,7 @@ defmodule Ash.Actions.Read.Relationships do
       end
 
     has_parent_expr_in_sort?(sort) ||
-      do_has_parent_expr?(filter)
+      Ash.Filter.has_parent_expr?(filter)
   end
 
   @doc false
@@ -2195,13 +2195,14 @@ defmodule Ash.Actions.Read.Relationships do
         context,
         domain
       ) do
-    case Ash.Actions.Sort.process(destination, sort, %{}, rel_context) do
-      {:ok, sort} ->
-        sort
+    sort =
+      case Ash.Actions.Sort.process(destination, sort, %{}, rel_context) do
+        {:ok, sort} ->
+          sort
 
-      _ ->
-        nil
-    end
+        _ ->
+          nil
+      end
 
     parent_stack = [source | Ash.Actions.Read.parent_stack_from_context(context)]
 
@@ -2223,7 +2224,7 @@ defmodule Ash.Actions.Read.Relationships do
         parent_stack: parent_stack,
         source_context: context
       )
-      |> do_has_parent_expr?()
+      |> Ash.Filter.has_parent_expr?()
   end
 
   defp has_parent_expr_in_sort?(sort) do
@@ -2244,7 +2245,7 @@ defmodule Ash.Actions.Read.Relationships do
             calculation.context
           )
 
-        do_has_parent_expr?(expression)
+        Ash.Filter.has_parent_expr?(expression)
 
       {%Ash.Query.Calculation{} = calculation, _} ->
         expression =
@@ -2254,53 +2255,8 @@ defmodule Ash.Actions.Read.Relationships do
             calculation.context
           )
 
-        do_has_parent_expr?(expression)
+        Ash.Filter.has_parent_expr?(expression)
     end)
-  end
-
-  @doc false
-  def do_has_parent_expr?(filter, depth \\ 0) do
-    not is_nil(
-      Ash.Filter.find(
-        filter,
-        fn
-          %Ash.Query.Call{name: :parent, args: [expr]} ->
-            if depth == 0 do
-              true
-            else
-              do_has_parent_expr?(expr, depth - 1)
-            end
-
-          %Ash.Query.Exists{expr: expr} ->
-            do_has_parent_expr?(expr, depth + 1)
-
-          %Ash.Query.Parent{expr: expr} ->
-            if depth == 0 do
-              true
-            else
-              do_has_parent_expr?(expr, depth - 1)
-            end
-
-          %Ash.Query.Ref{
-            attribute: %Ash.Query.Aggregate{
-              field: %Ash.Query.Calculation{module: module, opts: opts, context: context}
-            }
-          } ->
-            if Ash.Resource.Calculation.has_expression?(module) do
-              Ash.Resource.Calculation.expression(module, opts, context)
-              |> do_has_parent_expr?(depth + 1)
-            else
-              false
-            end
-
-          _other ->
-            false
-        end,
-        true,
-        true,
-        true
-      )
-    )
   end
 
   defp apply_relationship_offset(query, relationship) do
