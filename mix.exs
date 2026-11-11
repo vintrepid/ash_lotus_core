@@ -401,7 +401,7 @@ defmodule Ash.MixProject do
     [
       {:usage_rules, "~> 1.3 and >= 1.3.1", only: [:dev]},
       # DSLs
-      {:spark, "~> 2.7 and >= 2.7.9"},
+      {:spark, "~> 2.7 and >= 2.7.10"},
       # Ash resources are backed by ecto scheams
       {:ecto, "~> 3.14 and >= 3.14.3"},
       # Used by the ETS data layer
@@ -437,7 +437,7 @@ defmodule Ash.MixProject do
       {:dialyxir, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:mimic, "~> 2.5", only: [:test]},
       {:sobelow, ">= 0.0.0", only: [:dev, :test], runtime: false},
-      {:git_ops, "~> 2.12 and >= 2.12.3", only: [:dev, :test]},
+      {:git_ops, "~> 2.12 and >= 2.12.4", only: [:dev, :test]},
       {:mix_audit, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:mix_test_watch, "~> 1.4", only: [:dev, :test], runtime: false},
       {:benchee, "~> 1.5 and >= 1.5.1", only: [:dev, :test]},
