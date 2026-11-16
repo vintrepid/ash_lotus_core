@@ -818,6 +818,28 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
     end)
   end
 
+  test "atomic updates that return records leave nothing in the process dictionary" do
+    Ash.bulk_create!([%{title: "title1"}, %{title: "title2"}], Post, :create, authorize?: false)
+
+    for strategy <- [:atomic, :atomic_batches] do
+      assert %Ash.BulkResult{status: :success, records: [_, _]} =
+               Ash.bulk_update!(Post, :update, %{title2: "updated value"},
+                 strategy: strategy,
+                 return_records?: true,
+                 authorize?: false
+               )
+
+      assert leftover_bulk_keys() == []
+    end
+  end
+
+  defp leftover_bulk_keys do
+    Enum.filter(
+      Process.get_keys(),
+      &match?({key, _} when key in [:any_success?, :bulk_notifications], &1)
+    )
+  end
+
   test "the `filter` option skips records that no longer match it with the stream strategy" do
     [unchanged, changed] =
       Ash.bulk_create!([%{title: "title"}, %{title: "title"}], Post, :create,
@@ -1061,7 +1083,7 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
   test "an atomic bulk update given the action's name can report missed notifications" do
     post = Ash.create!(Post, %{title: "title1"}, authorize?: false)
 
-    missed = %Ash.Notifier.Notification{resource: MnesiaPost, domain: Domain, for: []}
+    missed = %Ash.Notifier.Notification{resource: MnesiaPost, domain: Domain, for: [Notifier]}
 
     log =
       capture_log(fn ->
@@ -1081,6 +1103,31 @@ defmodule Ash.Test.Actions.BulkUpdateTest do
 
     assert log =~ "Missed 1 notifications in action"
     assert log =~ "BulkUpdateTest.Post.update"
+  end
+
+  test "an atomic bulk update does not report a notification for no notifiers as missed" do
+    post = Ash.create!(Post, %{title: "title1"}, authorize?: false)
+
+    for_no_notifiers = %Ash.Notifier.Notification{resource: MnesiaPost, domain: Domain, for: []}
+    missed = %{for_no_notifiers | for: [Notifier]}
+
+    log =
+      capture_log(fn ->
+        assert {:atomic, %Ash.BulkResult{status: :success, notifications: [^missed]}} =
+                 :mnesia.transaction(fn ->
+                   Ash.Actions.Helpers.queue_notifications([for_no_notifiers, missed])
+
+                   Post
+                   |> Ash.Query.filter(id == ^post.id)
+                   |> Ash.bulk_update(:update, %{title2: "updated value"},
+                     strategy: :atomic,
+                     notify?: true,
+                     authorize?: false
+                   )
+                 end)
+      end)
+
+    assert log =~ "Missed 1 notifications in action"
   end
 
   test "context provided in opts is set on changesets, query context is not" do
