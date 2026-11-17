@@ -224,13 +224,13 @@ if Code.ensure_loaded?(Igniter) do
       |> Igniter.Scribe.section("Sign Pagination Keysets", @setup_keyset_signing, fn igniter ->
         Igniter.Scribe.patch(igniter, fn igniter ->
           igniter
-          |> Igniter.Project.Config.configure(
+          |> Igniter.Project.Config.configure_new(
             "dev.exs",
             :ash,
             [:keyset_signing_secret],
             generate_secret(igniter)
           )
-          |> Igniter.Project.Config.configure(
+          |> Igniter.Project.Config.configure_new(
             "test.exs",
             :ash,
             [:keyset_signing_secret],
@@ -240,7 +240,8 @@ if Code.ensure_loaded?(Igniter) do
             :prod,
             :ash,
             [:keyset_signing_secret],
-            {:code, prod_keyset_signing_secret(igniter)}
+            {:code, prod_keyset_signing_secret(igniter)},
+            updater: &{:ok, &1}
           )
         end)
       end)
@@ -291,6 +292,8 @@ if Code.ensure_loaded?(Igniter) do
             raise "environment variable ASH_KEYSET_SIGNING_SECRET is missing"
         end
       end
+      |> Macro.to_string()
+      |> Sourceror.parse_string!()
     end
 
     # Phoenix sets `secret_key_base` for its endpoint in `config/dev.exs`

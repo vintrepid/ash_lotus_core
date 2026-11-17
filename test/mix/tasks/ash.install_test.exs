@@ -120,4 +120,20 @@ defmodule Mix.Tasks.Ash.InstallTest do
     |> Rewrite.source!(path)
     |> Rewrite.Source.get(:content)
   end
+
+  test "reapplying installation preserves keyset secrets and runtime expressions" do
+    for files <- [
+          %{},
+          %{
+            "config/dev.exs" =>
+              "import Config\nconfig :test, TestWeb.Endpoint, secret_key_base: \"synthetic test secret\"\n"
+          }
+        ] do
+      test_project(files: files)
+      |> Igniter.compose_task("ash.install", [])
+      |> apply_igniter!()
+      |> Igniter.compose_task("ash.install", [])
+      |> assert_unchanged()
+    end
+  end
 end
