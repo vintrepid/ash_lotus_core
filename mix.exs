@@ -410,9 +410,9 @@ defmodule Ash.MixProject do
       {:decimal, "~> 2.0 or ~> 3.0"},
       {:jason, ">= 1.0.0"},
       # Observability
-      {:telemetry, "~> 1.4 and >= 1.4.2"},
+      {:telemetry, "~> 1.4 and >= 1.4.3"},
       # Used for providing Ash.Reactor, will be used more in the future
-      {:reactor, "~> 1.0 and >= 1.0.7"},
+      {:reactor, "~> 1.0 and >= 1.0.8"},
       # Used for Ash.PlugHelpers
       {:plug, ">= 0.0.0", optional: true},
       # Used for aggregatable and standardized exceptions
