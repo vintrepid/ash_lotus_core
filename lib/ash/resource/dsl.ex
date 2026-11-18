@@ -429,10 +429,14 @@ defmodule Ash.Resource.Dsl do
       "change {MyCustomChange, :foo}"
     ],
     no_depend_modules: [:change],
+    imports: [
+      Ash.Resource.Validation.Builtins,
+      Ash.Resource.Change.Builtins,
+      Ash.Expr
+    ],
     target: Ash.Resource.Change,
     schema: Ash.Resource.Change.action_schema(),
-    args: [:change],
-    imports: [Ash.Resource.Change.Builtins]
+    args: [:change]
   }
 
   @action_argument %Spark.Dsl.Entity{
@@ -632,8 +636,8 @@ defmodule Ash.Resource.Dsl do
     target: Ash.Resource.Preparation,
     schema: Ash.Resource.Preparation.schema(),
     no_depend_modules: [:preparation],
-    args: [:preparation],
-    imports: [Ash.Resource.Preparation.Builtins]
+    imports: [Ash.Resource.Preparation.Builtins, Ash.Resource.Validation.Builtins, Ash.Expr],
+    args: [:preparation]
   }
 
   if Application.compile_env(:ash, :infer_generic_action_reactors?, true) do
