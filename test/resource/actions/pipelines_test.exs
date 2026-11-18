@@ -12,10 +12,10 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest.Helpers do
         use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
 
         attributes do
-          uuid_primary_key :id
-          attribute :name, :string, public?: true
-          attribute :score, :integer, public?: true, default: 0
-          attribute :state, :atom, public?: true
+          uuid_primary_key(:id)
+          attribute(:name, :string, public?: true)
+          attribute(:score, :integer, public?: true, default: 0)
+          attribute(:state, :atom, public?: true)
         end
 
         unquote(body)
@@ -37,17 +37,17 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
   defresource FullCUD do
     pipelines do
       pipeline :full do
-        change set_attribute(:score, 1)
-        validate present(:name)
-        prepare build(sort: [:name])
+        change(set_attribute(:score, 1))
+        validate(present(:name))
+        prepare(build(sort: [:name]))
       end
     end
 
     actions do
       create :with_full do
-        pipe_through [:full]
-        accept [:name]
-        change set_attribute(:state, :created)
+        pipe_through([:full])
+        accept([:name])
+        change(set_attribute(:state, :created))
       end
     end
   end
@@ -55,15 +55,15 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
   defresource FullRead do
     pipelines do
       pipeline :full do
-        change set_attribute(:score, 1)
-        validate present(:name)
-        prepare build(sort: [:name])
+        change(set_attribute(:score, 1))
+        validate(present(:name))
+        prepare(build(sort: [:name]))
       end
     end
 
     actions do
       read :with_full do
-        pipe_through [:full]
+        pipe_through([:full])
       end
     end
   end
@@ -117,19 +117,19 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
       defresource MultiPipeline do
         pipelines do
           pipeline :pipeline_a do
-            change set_attribute(:score, 1)
+            change(set_attribute(:score, 1))
           end
 
           pipeline :pipeline_b do
-            change set_attribute(:state, :active)
+            change(set_attribute(:state, :active))
           end
         end
 
         actions do
           create :multi do
-            pipe_through [:pipeline_a, :pipeline_b]
-            accept [:name]
-            change set_attribute(:name, "from_action")
+            pipe_through([:pipeline_a, :pipeline_b])
+            accept([:name])
+            change(set_attribute(:name, "from_action"))
           end
         end
       end
@@ -152,16 +152,16 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
       defresource PlacementBetween do
         pipelines do
           pipeline :p do
-            change set_attribute(:score, 1)
+            change(set_attribute(:score, 1))
           end
         end
 
         actions do
           create :ordered do
-            accept [:name]
-            change set_attribute(:state, :before)
-            pipe_through [:p]
-            change set_attribute(:name, "after")
+            accept([:name])
+            change(set_attribute(:state, :before))
+            pipe_through([:p])
+            change(set_attribute(:name, "after"))
           end
         end
       end
@@ -185,19 +185,19 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
       defresource MultiPipeThrough do
         pipelines do
           pipeline :audit do
-            change set_attribute(:score, 1)
+            change(set_attribute(:score, 1))
           end
 
           pipeline :guard do
-            change set_attribute(:state, :guarded)
+            change(set_attribute(:state, :guarded))
           end
         end
 
         actions do
           create :guarded_audit do
-            pipe_through [:audit]
-            pipe_through [:guard], where: present(:name)
-            accept [:name]
+            pipe_through([:audit])
+            pipe_through([:guard], where: present(:name))
+            accept([:name])
           end
         end
       end
@@ -216,15 +216,15 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
       defresource WhereConditional do
         pipelines do
           pipeline :guarded do
-            change set_attribute(:score, 99)
-            validate present(:state)
+            change(set_attribute(:score, 99))
+            validate(present(:state))
           end
         end
 
         actions do
           create :guarded_create do
-            pipe_through [:guarded], where: present(:name)
-            accept [:name]
+            pipe_through([:guarded], where: present(:name))
+            accept([:name])
           end
         end
       end
@@ -241,14 +241,14 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
       defresource WhereMerge do
         pipelines do
           pipeline :already_guarded do
-            change set_attribute(:score, 99), where: present(:state)
+            change(set_attribute(:score, 99), where: present(:state))
           end
         end
 
         actions do
           create :double_guard do
-            pipe_through [:already_guarded], where: present(:name)
-            accept [:name]
+            pipe_through([:already_guarded], where: present(:name))
+            accept([:name])
           end
         end
       end
@@ -265,8 +265,8 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
         defresource UnknownPipeline do
           actions do
             create :bad do
-              pipe_through [:nonexistent]
-              accept [:name]
+              pipe_through([:nonexistent])
+              accept([:name])
             end
           end
         end
@@ -278,13 +278,13 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
         defresource UnsupportedValidation do
           pipelines do
             pipeline :changeset_only do
-              validate {Ash.Resource.Validation.DataOneOf, attribute: :name, values: ["a", "b"]}
+              validate({Ash.Resource.Validation.DataOneOf, attribute: :name, values: ["a", "b"]})
             end
           end
 
           actions do
             read :bad_read do
-              pipe_through [:changeset_only]
+              pipe_through([:changeset_only])
             end
           end
         end
@@ -297,16 +297,18 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
       defresource ChangeAfterAction do
         pipelines do
           pipeline :hook do
-            change after_action(fn _changeset, record, _context ->
-                     {:ok, %{record | score: 1}}
-                   end)
+            change(
+              after_action(fn _changeset, record, _context ->
+                {:ok, %{record | score: 1}}
+              end)
+            )
           end
         end
 
         actions do
           create :piped do
-            pipe_through [:hook]
-            accept [:name]
+            pipe_through([:hook])
+            accept([:name])
           end
         end
       end
@@ -323,16 +325,16 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
       defresource IntrospectPipelines do
         pipelines do
           pipeline :a do
-            change set_attribute(:score, 1)
+            change(set_attribute(:score, 1))
           end
 
           pipeline :b do
-            prepare build(sort: [:name])
+            prepare(build(sort: [:name]))
           end
         end
 
         actions do
-          defaults [:read]
+          defaults([:read])
         end
       end
 
@@ -346,5 +348,55 @@ defmodule Ash.Test.Resource.Actions.PipelinesTest do
 
       assert Info.pipeline(IntrospectPipelines, :nonexistent) == nil
     end
+  end
+
+  test "change and preparation hooks keep their subject-specific builtin scopes" do
+    defresource ScopedPipelineBuiltins do
+      pipelines do
+        pipeline :change_hooks do
+          change(set_context(%{score: 7}))
+
+          change(
+            before_action(fn changeset, _ ->
+              Ash.Changeset.force_change_attribute(changeset, :score, changeset.context.score)
+            end)
+          )
+
+          change(after_action(fn _, record, _ -> {:ok, %{record | score: record.score + 1}} end))
+        end
+
+        pipeline :read_hooks do
+          prepare(set_context(%{offset: 2}))
+
+          prepare(
+            before_action(fn query, _ ->
+              Ash.Query.set_context(query, %{offset: query.context.offset + 1})
+            end)
+          )
+
+          prepare(
+            after_action(fn query, records, _ ->
+              {:ok, Enum.map(records, &%{&1 | score: &1.score + query.context.offset})}
+            end)
+          )
+        end
+      end
+
+      actions do
+        create :piped_create do
+          pipe_through([:change_hooks])
+          accept([:name])
+        end
+
+        read :piped_read do
+          pipe_through([:read_hooks])
+        end
+      end
+    end
+
+    assert %{score: 8} =
+             Ash.create!(ScopedPipelineBuiltins, %{name: "scoped"}, action: :piped_create)
+
+    assert [%{score: 10}] = Ash.read!(ScopedPipelineBuiltins, action: :piped_read)
   end
 end

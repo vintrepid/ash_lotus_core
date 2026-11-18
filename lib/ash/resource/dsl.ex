@@ -431,7 +431,8 @@ defmodule Ash.Resource.Dsl do
     no_depend_modules: [:change],
     target: Ash.Resource.Change,
     schema: Ash.Resource.Change.action_schema(),
-    args: [:change]
+    args: [:change],
+    imports: [Ash.Resource.Change.Builtins]
   }
 
   @action_argument %Spark.Dsl.Entity{
@@ -631,7 +632,8 @@ defmodule Ash.Resource.Dsl do
     target: Ash.Resource.Preparation,
     schema: Ash.Resource.Preparation.schema(),
     no_depend_modules: [:preparation],
-    args: [:preparation]
+    args: [:preparation],
+    imports: [Ash.Resource.Preparation.Builtins]
   }
 
   if Application.compile_env(:ash, :infer_generic_action_reactors?, true) do
