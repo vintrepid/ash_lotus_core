@@ -8,6 +8,46 @@ SPDX-License-Identifier: MIT
 
 <!-- changelog -->
 
+## [v3.38.1](https://github.com/ash-project/ash/compare/v3.38.0...v3.38.1) (2026-11-24)
+
+
+
+
+### Improvements:
+
+* name the expression of an anonymous sort in keyset errors by [@zachdaniel](https://github.com/zachdaniel)
+
+### Bug Fixes:
+
+* [security] don't cast keyword input fields with storage casting ([CVE-2026-120299](https://cna.erlef.org/cves/CVE-2026-120299.html), [GHSA-rwmx-99mc-qr2x](https://github.com/ash-project/ash/security/advisories/GHSA-rwmx-99mc-qr2x)) by [@zachdaniel](https://github.com/zachdaniel)
+
+* correct misspelled deprecated key in Ash.SatSolver moduledoc (#3133) by kayaal34 [(#3133)](https://github.com/ash-project/ash/pull/3133)
+
+* encode keyset values whose type can't be determined as JSON by [@zachdaniel](https://github.com/zachdaniel)
+
+## [v3.38.0](https://github.com/ash-project/ash/compare/v3.37.7...v3.38.0) (2026-11-24)
+
+
+
+
+### Features:
+
+* trace authorization phases and emit telemetry events (#3117) by Ashu3208 [(#3117)](https://github.com/ash-project/ash/pull/3117)
+
+### Improvements:
+
+* validate args in define_calculation code interfaces (#3130) by porterbrien [(#3130)](https://github.com/ash-project/ash/pull/3130)
+
+### Bug Fixes:
+
+* [security] encode keysets as JSON unless `keyset_signing_secret` is set, so forged keysets are never deserialized as Erlang terms ([CVE-2026-124283](https://cna.erlef.org/cves/CVE-2026-124283.html), [GHSA-m5v6-3qwf-6w9r](https://github.com/ash-project/ash/security/advisories/GHSA-m5v6-3qwf-6w9r)) by [@zachdaniel](https://github.com/zachdaniel)
+
+* encode each keyset value as a JSON fragment by [@zachdaniel](https://github.com/zachdaniel)
+
+* don't check that JSON keyset values round trip when encoding by [@zachdaniel](https://github.com/zachdaniel)
+
+* build JSON keysets from per-value encodings instead of re-encoding by [@zachdaniel](https://github.com/zachdaniel)
+
 ## [v3.37.7](https://github.com/ash-project/ash/compare/v3.37.6...v3.37.7) (2026-11-18)
 
 
