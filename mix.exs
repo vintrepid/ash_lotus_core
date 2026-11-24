@@ -399,49 +399,49 @@ defmodule Ash.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:usage_rules, "~> 1.3 and >= 1.3.1", only: [:dev]},
+      {:usage_rules, ">= 1.3.1", only: [:dev]},
       # DSLs
-      {:spark, "~> 2.7 and >= 2.7.10"},
+      {:spark, ">= 2.7.10"},
       # Ash resources are backed by ecto scheams
-      {:ecto, "~> 3.14 and >= 3.14.3"},
+      {:ecto, ">= 3.14.3"},
       # Used by the ETS data layer
-      {:ets, "~> 0.9.0"},
+      {:ets, ">= 0.9.0"},
       # Data & types
       {:decimal, "~> 2.0 or ~> 3.0"},
       {:jason, ">= 1.0.0"},
       # Observability
-      {:telemetry, "~> 1.4 and >= 1.4.3"},
+      {:telemetry, ">= 1.4.3"},
       # Used for providing Ash.Reactor, will be used more in the future
-      {:reactor, "~> 1.0 and >= 1.0.8"},
+      {:reactor, ">= 1.0.8"},
       # Used for Ash.PlugHelpers
       {:plug, ">= 0.0.0", optional: true},
       # Used for aggregatable and standardized exceptions
-      {:splode, "~> 0.3.3"},
+      {:splode, ">= 0.3.3"},
       # Testing Utilities
-      {:stream_data, "~> 1.4"},
+      {:stream_data, ">= 1.4.0"},
 
       # SAT Solvers
-      {:crux, "~> 0.1.5"},
-      {:picosat_elixir, "~> 0.2.3", optional: true},
-      {:simple_sat, "~> 0.1.4", optional: true},
+      {:crux, ">= 0.1.5"},
+      {:picosat_elixir, ">= 0.2.3", optional: true},
+      {:simple_sat, ">= 0.1.4", optional: true},
 
       # Code Generators
-      {:igniter, "~> 0.8.5", optional: true},
+      {:igniter, ">= 0.8.5", optional: true},
 
       # Dev/Test dependencies
-      {:eflame, "~> 1.0 and >= 1.0.1", only: [:dev, :test]},
-      {:ex_doc, "~> 0.40.4", only: [:dev, :test], runtime: false},
-      {:makeup_diff, "~> 0.1.1", only: [:dev, :test], runtime: false},
-      {:ex_check, "~> 0.17.1", only: [:dev, :test]},
+      {:eflame, ">= 1.0.1", only: [:dev, :test]},
+      {:ex_doc, ">= 0.40.4", only: [:dev, :test], runtime: false},
+      {:makeup_diff, ">= 0.1.1", only: [:dev, :test], runtime: false},
+      {:ex_check, ">= 0.17.1", only: [:dev, :test]},
       {:credo, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:dialyxir, ">= 0.0.0", only: [:dev, :test], runtime: false},
-      {:mimic, "~> 2.5", only: [:test]},
+      {:mimic, ">= 2.5.0", only: [:test]},
       {:sobelow, ">= 0.0.0", only: [:dev, :test], runtime: false},
-      {:git_ops, "~> 2.12 and >= 2.12.4", only: [:dev, :test]},
+      {:git_ops, ">= 2.12.4", only: [:dev, :test]},
       {:mix_audit, ">= 0.0.0", only: [:dev, :test], runtime: false},
-      {:mix_test_watch, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:benchee, "~> 1.5 and >= 1.5.1", only: [:dev, :test]},
-      {:tz, "~> 0.28.4", only: [:test]}
+      {:mix_test_watch, ">= 1.4.0", only: [:dev, :test], runtime: false},
+      {:benchee, ">= 1.5.1", only: [:dev, :test]},
+      {:tz, ">= 0.28.4", only: [:test]}
     ]
   end
 
